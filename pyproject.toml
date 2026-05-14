@@ -12,6 +12,8 @@ dependencies = [
     "cryptography",
     "pytest",
     "pytest-asyncio",
+    "rawpy",
+    "tifffile",
 ]
 
 [build-system]
