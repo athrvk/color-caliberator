@@ -64,10 +64,11 @@ Choose mode on the PC setup screen.
 curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 # Windows: https://docs.astral.sh/uv/getting-started/installation/
 
-# 1. Install ArgyllCMS so we can talk to your display
-brew install argyll-cms          # macOS
-sudo apt install argyll         # Linux
-# Windows: https://www.argyllcms.com/downloadwin.html
+# 1. (Linux only) install ArgyllCMS — provides the `dispwin` binary we use
+#    for VideoLUT manipulation on X11. macOS and Windows use native OS APIs
+#    (CoreGraphics / GDI) directly — no extra install needed.
+sudo apt install argyll         # Linux (Debian/Ubuntu)
+# Other distros: install the `argyll` or `argyllcms` package.
 
 # 2. Clone, install deps, and run
 git clone https://github.com/athrvk/color-caliberator.git
@@ -148,24 +149,25 @@ Apple TV Color Balance uses internally with iPhone sensors.
 | Server | FastAPI + uvicorn, async, single-session |
 | Transport | WebSockets (one reader task per socket, queue dispatch) |
 | Math | numpy + scipy (`curve_fit` power-law) |
-| Display I/O | ArgyllCMS `dispwin` via subprocess |
+| Display I/O | macOS `CGSetDisplayTransferByTable` / Windows `SetDeviceGammaRamp` (ctypes) / Linux `dispwin` |
 | ICC output | Raw bytes via `struct`, includes Apple VCGT tag |
 | TLS | Self-signed cert via `cryptography`, auto-regen on LAN-IP change |
 | Mobile | Plain HTML/JS, `getUserMedia`, JPEG frames at 5 fps over WS |
 | QR | `qrcode[pil]` |
-| Tests | pytest + pytest-asyncio (49 tests) |
+| Tests | pytest + pytest-asyncio (54 tests) |
 
 ### Architecture in 30 seconds
 
 ```
-main.py                       # dispwin check, TLS cert, uvicorn
+main.py                       # backend probe, TLS cert, uvicorn
 src/calibration/
   patches.py                  # 11 gray + 3 holdout patch definitions
   capture.py                  # SSNR stability, BT.601 luma, JPEG decode
   ramp.py                     # Gamma fit, LUT compose, VCGT conversion
   iterate.py                  # Async calibration loop (the brain)
 src/display/
-  dispwin.py                  # ArgyllCMS subprocess wrapper
+  videolut.py                 # Native VideoLUT backends (macOS / Windows / Linux dispatcher)
+  dispwin.py                  # ArgyllCMS subprocess wrapper (Linux backend)
   profile.py                  # ICC v2 byte-level builder + VCGT tag
 src/util/
   qr.py                       # QR codes for the mobile URL
@@ -174,7 +176,7 @@ src/web/
   server.py                   # FastAPI app + WebSocket session
   static/pc.html              # PC wizard
   static/mobile.html          # Mobile camera page
-tests/                        # 49 tests, all green
+tests/                        # 54 tests, all green
 ```
 
 ### Key design notes for contributors
@@ -182,8 +184,9 @@ tests/                        # 49 tests, all green
 - **Single-reader invariant on each WebSocket.** Concurrent `receive_text`
   calls raise `RuntimeError` in Starlette. One reader task per socket pushes
   parsed JSON into an `asyncio.Queue`; everything else consumes from there.
-- **`asyncio.to_thread` around dispwin** — the subprocess blocks for ~100 ms
-  per call. Don't stall the event loop while frames are still streaming in.
+- **`asyncio.to_thread` around VideoLUT calls** — macOS/Windows ctypes calls
+  and the Linux dispwin subprocess can stall briefly. Don't block the event
+  loop while frames are still streaming in.
 - **Stale frames are drained** between patches. Mobile streams at 5 fps; a few
   frames are always in flight when `stop_capture` lands. Skip them.
 - **Black level is dropped** from the curve fit. Phone cameras are too noisy
@@ -197,7 +200,7 @@ tests/                        # 49 tests, all green
 ## Requirements
 
 - Python 3.11+ and [`uv`](https://docs.astral.sh/uv/)
-- ArgyllCMS (`dispwin` on PATH)
+- macOS or Windows: nothing extra. Linux/X11: ArgyllCMS (`dispwin` on PATH). Linux/Wayland: not supported — log into an X11 session.
 - A phone with a modern browser (Chrome / Safari iOS 14.5+)
 - PC and phone on the same LAN
 - A room you can darken

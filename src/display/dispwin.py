@@ -22,7 +22,11 @@ def _run(args: list[str], retries: int = 3, delay: float = 0.5) -> None:
 
 
 def apply_ramp(profile_path: str, display_index: int = 1) -> None:
-    """Load an ICC profile's VCGT tag as the display's VideoLUT."""
+    """Load an ICC profile's VCGT tag as the display's VideoLUT.
+
+    Used only by the Linux backend in `display.videolut`. macOS and Windows
+    talk to their OS APIs directly via ctypes — no ArgyllCMS dependency.
+    """
     _run(["dispwin", f"-d{display_index}", profile_path])
 
 

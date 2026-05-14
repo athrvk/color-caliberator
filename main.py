@@ -3,21 +3,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-from display.dispwin import find_dispwin
+from display.videolut import backend_available, backend_error, backend_name
 from util.tls import detect_lan_ip, ensure_cert
 
 
 def main():
-    dispwin = find_dispwin()
-    if dispwin is None:
+    if not backend_available():
         print(
-            "\n[color-calibrator] ERROR: 'dispwin' not found on PATH.\n"
-            "Install ArgyllCMS:\n"
-            "  Windows: https://www.argyllcms.com/downloadwin.html\n"
-            "  Mac:     brew install argyll-cms\n"
-            "  Linux:   sudo apt install argyll\n"
+            f"\n[color-calibrator] ERROR: no VideoLUT backend available "
+            f"({backend_error()}).\n"
+            "  macOS / Windows: should work out of the box. File a bug.\n"
+            "  Linux:           install ArgyllCMS (`sudo apt install argyll` or distro equivalent).\n"
+            "  Wayland:         log into an X11 session — Wayland is unsupported.\n"
         )
         sys.exit(1)
+    print(f"[color-calibrator] VideoLUT backend: {backend_name()}")
 
     cert_path, key_path = ensure_cert(Path(__file__).parent / ".cert")
     ip = detect_lan_ip()

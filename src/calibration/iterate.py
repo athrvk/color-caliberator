@@ -20,8 +20,8 @@ from calibration.ramp import (
     identity_lut,
     lut_to_vcgt,
 )
-from display.dispwin import apply_ramp, clear_ramp
 from display.profile import build_vcgt_profile
+from display.videolut import apply_ramp_arrays, clear_ramp
 
 SendFn = Callable[[dict], Awaitable[None]]
 RecvFn = Callable[[], Awaitable[dict]]
@@ -333,16 +333,12 @@ async def run_calibration(
         await mobile_send({"type": "round_done"})
         return icc_bytes, float("nan"), r_trc, g_trc, b_trc
 
-    import sys as _sys
-
-    # On Windows, SetDeviceGammaRamp (used by dispwin) is reset by the OS and
-    # other drivers between rounds, making mid-loop VideoLUT writes unreliable.
-    # Instead we pre-warp the patch display level through the current correction
-    # LUT so the display sees the compensated input — mathematically equivalent
-    # convergence without touching the VideoLUT during measurement.
-    # On Mac/Linux dispwin VideoLUT access is stable so we use it as intended.
-    _windows_mode = _sys.platform == "win32"
-
+    # Native VideoLUT manipulation via display.videolut backend:
+    #   macOS  → CGSetDisplayTransferByTable (CoreGraphics, transient, no admin)
+    #   Windows → SetDeviceGammaRamp (GDI, with retry against competing software)
+    #   Linux/X11 → dispwin subprocess (XF86VidMode under the hood)
+    # All three apply LUTs at session scope; the user's installed ColorSync /
+    # system profile is restored on `clear_ramp`.
     lut_r = identity_lut()
     lut_g = identity_lut()
     lut_b = identity_lut()
@@ -351,19 +347,10 @@ async def run_calibration(
     best_luts = (lut_r.copy(), lut_g.copy(), lut_b.copy())
 
     for round_num in range(1, MAX_ROUNDS + 1):
-        if _windows_mode:
-            # Windows: keep VideoLUT at identity; compensate by warping patch levels.
-            # Round 1 LUT is identity so patch levels are unchanged — same as Mac/Linux.
-            pass
-        else:
-            # Mac/Linux: apply accumulated correction to the display VideoLUT before measuring.
-            tmp_icc = tmp_dir / f"round_{round_num}.icc"
-            vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
-            await asyncio.to_thread(
-                tmp_icc.write_bytes, build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
-            )
-            await asyncio.to_thread(clear_ramp)
-            await asyncio.to_thread(apply_ramp, str(tmp_icc))
+        # Apply the accumulated correction to the display before measuring.
+        # Round 1: identity LUT (no-op load). Later rounds: the composed
+        # per-channel LUTs from previous rounds.
+        await asyncio.to_thread(apply_ramp_arrays, lut_r, lut_g, lut_b)
 
         measured_lumas: list[float] = []
         target_lumas: list[float] = []
@@ -371,19 +358,9 @@ async def run_calibration(
         patches = GRAY_PATCHES
         total = len(patches)
 
-        x256 = np.linspace(0.0, 1.0, 256)  # LUT index positions
-
         for i, patch in enumerate(patches):
-            if _windows_mode and round_num > 1:
-                # Pre-warp: look up what level the current LUT maps patch.level to,
-                # then show that warped level so the display's uncorrected gamma
-                # combined with the warped input produces the target output.
-                display_level = float(np.interp(patch.level, x256, lut_r))
-            else:
-                display_level = patch.level
-
             luma = await _measure_patch(
-                display_level, i, total, round_num,
+                patch.level, i, total, round_num,
                 white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
             )
             if luma is None:
@@ -431,10 +408,9 @@ async def run_calibration(
     vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
     icc_bytes = build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
 
-    if not _windows_mode:
-        # Clear any intermediate VideoLUT written during rounds so the display
-        # returns to its native uncorrected state. The final ICC (with its VCGT
-        # tag) is what the user installs; applying it is their explicit action.
-        await asyncio.to_thread(clear_ramp)
+    # Restore the user's installed profile / identity LUT so the display
+    # returns to a known state. The final ICC (with VCGT) is what the user
+    # installs persistently; applying it is their explicit action.
+    await asyncio.to_thread(clear_ramp)
 
     return icc_bytes, final_delta_e, lut_r, lut_g, lut_b

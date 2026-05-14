@@ -57,7 +57,7 @@ class FakeProtocol:
 @pytest.mark.asyncio
 async def test_run_calibration_converges_on_gamma_1_8_display(monkeypatch):
     monkeypatch.setattr(iterate, "clear_ramp", lambda *a, **k: None)
-    monkeypatch.setattr(iterate, "apply_ramp", lambda *a, **k: None)
+    monkeypatch.setattr(iterate, "apply_ramp_arrays", lambda *a, **k: None)
     monkeypatch.setattr(iterate, "SETTLE_DELAY", 0.0)
 
     fake = FakeProtocol(display_gamma=1.8)
@@ -101,7 +101,7 @@ _SAMPLES = {
 @pytest.mark.asyncio
 async def test_run_calibration_color_mode_returns_matrix_profile(monkeypatch):
     monkeypatch.setattr(iterate, "clear_ramp", lambda *a, **k: None)
-    monkeypatch.setattr(iterate, "apply_ramp", lambda *a, **k: None)
+    monkeypatch.setattr(iterate, "apply_ramp_arrays", lambda *a, **k: None)
     monkeypatch.setattr(iterate, "SETTLE_DELAY", 0.0)
 
     call_idx = {"i": 0}

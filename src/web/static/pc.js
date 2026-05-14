@@ -166,7 +166,17 @@ ws.onmessage = ({ data }) => {
   if (msg.type === 'mobile_connected') {
     setConn('live', 'mobile connected');
     show('setup');
-    document.getElementById('begin-btn').onclick = () => {
+    document.getElementById('begin-btn').onclick = async () => {
+      // Request fullscreen on this click (user-gesture context). Browser
+      // chrome — tabs, address bar, taskbar — leaks light into the camera
+      // and contaminates patch measurements. If the browser refuses, fall
+      // back to a banner asking the user to press F11 / ⌃⌘F manually.
+      try {
+        await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+      } catch (e) {
+        const hint = document.getElementById('fs-hint');
+        if (hint) hint.style.display = 'block';
+      }
       const mode = document.querySelector('input[name="mode"]:checked').value;
       ws.send(JSON.stringify({ type: 'start_calibration', mode }));
       const btn = document.getElementById('begin-btn');
