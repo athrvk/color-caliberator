@@ -214,5 +214,5 @@ uv run pytest -v
 
 ## License
 
-Open source. Use it. Hack it. Send pull requests. Don't blame us if your
+Open source. Use it. Hack it. Send pull requests. Don't blame me if your
 monitor still looks bad — buy a real colorimeter.
