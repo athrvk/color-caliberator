@@ -2,7 +2,7 @@
 Iterative calibration loop.
 
 Receives send/recv callbacks for PC and mobile WebSocket connections.
-Returns (icc_bytes, final_delta_e) when done.
+Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b) when done.
 """
 
 import asyncio
@@ -169,7 +169,7 @@ async def run_calibration(
 ) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run the full iterative calibration session.
-    Returns (icc_bytes, final_delta_e).
+    Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b).
     """
     white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain)
 

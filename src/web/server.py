@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import json
-import socket
 import sys
 from pathlib import Path
 
@@ -13,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from display.dispwin import find_dispwin
 from util.qr import generate_qr_png
+from util.tls import detect_lan_ip
 
 import io
 import numpy as np
@@ -63,15 +63,6 @@ async def _reader(endpoint: Endpoint) -> None:
         endpoint.closed.set()
 
 
-def _local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
-
 # ---------- HTTP routes ----------
 
 @app.get("/")
@@ -103,7 +94,7 @@ async def ws_pc(websocket: WebSocket):
         session.pc = None
         return
 
-    ip = _local_ip()
+    ip = detect_lan_ip()
     mobile_url = f"https://{ip}:8765/mobile"
     qr_png = generate_qr_png(mobile_url)
     qr_b64 = base64.b64encode(qr_png).decode()
