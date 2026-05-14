@@ -64,7 +64,7 @@ body::before {
   position: fixed; top: 2px; left: 0; right: 0;
   display: flex; align-items: center; justify-content: space-between;
   padding: 0.9rem 2rem;
-  z-index: 50; pointer-events: none;
+  z-index: 50;
   border-bottom: 1px solid var(--border);
   background: rgba(6,9,14,0.7);
   backdrop-filter: blur(8px);
@@ -433,9 +433,9 @@ body::before {
   <div class="spectrum-bar"></div>
 
   <header class="app-header">
-    <link href="/" >
-    <span class="app-name"><em>Chroma</em> &nbsp;/&nbsp; Display Calibration</span>
-    </link>
+    <button onclick="window.location.href='/'" style="background:none; border:none; cursor:pointer; padding:0;">
+      <span class="app-name" style="pointer-events: stroke;"><em>Chroma</em> &nbsp;/&nbsp; Display Calibration</span>
+    </button>
     <div class="conn-row">
       <span class="conn-dot" id="conn-dot"></span>
       <span id="conn-label">connecting</span>
