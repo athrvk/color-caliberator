@@ -299,11 +299,11 @@ body::before {
 
 /* ── RESULT SCREEN ── */
 .result-wrap {
-  display: flex; gap: 3.5rem; align-items: flex-start;
-  width: 100%; max-width: 860px;
+  display: flex; gap: 2.5rem; align-items: flex-start;
+  width: 100%; max-width: 920px;
 }
-.result-left { flex: 0 0 auto; min-width: 200px; }
-.result-right { flex: 1; min-width: 0; }
+.result-left  { flex: 0 0 280px; max-width: 280px; }
+.result-right { flex: 1 1 0; min-width: 0; }
 
 .de-number {
   font-family: var(--mono); font-size: 5.5rem; font-weight: 400;
@@ -329,7 +329,7 @@ body::before {
 
 .de-note {
   font-size: 0.78rem; color: var(--text-dim);
-  line-height: 1.6; max-width: 210px; margin-bottom: 1.5rem;
+  line-height: 1.6; margin-bottom: 1.5rem;
 }
 
 .comparison-wrap {

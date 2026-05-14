@@ -145,8 +145,14 @@ function showResult(msg) {
   // LUTs in memory and flips the VideoLUT on click.
   const liveBox = document.getElementById('live-preview');
   if (msg.live_preview && liveBox) {
+    const previewCorrected = document.getElementById('preview-corrected-btn');
+    const failed = msg.mode !== 'color' && (msg.delta_e ?? 0) >= 10;
     liveBox.hidden = false;
-    document.getElementById('preview-corrected-btn').onclick = () => {
+    if (failed) {
+      previewCorrected.disabled = true;
+      previewCorrected.title = 'Calibration failed — preview disabled to avoid wrecking your display.';
+    }
+    previewCorrected.onclick = () => {
       ws.send(JSON.stringify({ type: 'preview_corrected' }));
     };
     document.getElementById('preview-original-btn').onclick = () => {

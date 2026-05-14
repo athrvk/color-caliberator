@@ -342,12 +342,14 @@ async def _run_calibration_task() -> None:
             # Stash for the live before/after toggle on the result screen.
             async with session.lock:
                 session.final_luts = (lut_r, lut_g, lut_b)
-            # Apply the corrected LUT so the result page already shows the
-            # post-calibration look. User can flip to "Original" to compare.
+            # Restore the user's installed VideoLUT before delivering the
+            # result. The "Show Corrected" button is opt-in — auto-applying
+            # a bad/failed calibration would leave the display wrong-looking
+            # until the user notices and clicks Show Original.
             try:
-                await asyncio.to_thread(apply_ramp_arrays, lut_r, lut_g, lut_b)
+                await asyncio.to_thread(clear_ramp)
             except Exception:
-                pass  # toggle still works even if initial apply fails
+                pass
             icc_b64 = base64.b64encode(icc_bytes).decode()
             import math
             delta_e_payload = None if math.isnan(delta_e) else delta_e
