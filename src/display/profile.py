@@ -54,6 +54,11 @@ def _vcgt_type(r: np.ndarray, g: np.ndarray, b: np.ndarray) -> bytes:
     return header + r_be + g_be + b_be
 
 
+def _cprt_type(text: str) -> bytes:
+    """ICC v2 'text' type used for copyright tag."""
+    return struct.pack(">4sI", b"text", 0) + text.encode("ascii") + b"\x00"
+
+
 def _build_header(profile_size: int) -> bytes:
     now = datetime.now(tz=timezone.utc)
     h = b""
@@ -67,7 +72,7 @@ def _build_header(profile_size: int) -> bytes:
                      now.year, now.month, now.day,
                      now.hour, now.minute, now.second)
     h += b"acsp"
-    h += struct.pack(">I", 0)
+    h += b"MSFT"   # primary platform: Microsoft
     h += struct.pack(">I", 0)
     h += struct.pack(">I", 0)
     h += struct.pack(">I", 0)
@@ -94,6 +99,7 @@ def build_vcgt_profile(
     """
     tags_data: dict[bytes, bytes] = {
         b"desc": _desc_type("Color Calibrator"),
+        b"cprt": _cprt_type("Public Domain"),
         b"wtpt": _xyz_type(0.95045, 1.00000, 1.08905),
         b"rXYZ": _xyz_type(0.43607, 0.22249, 0.01392),
         b"gXYZ": _xyz_type(0.38515, 0.71687, 0.09708),
@@ -152,6 +158,7 @@ def build_matrix_shaper_profile(
 
     tags_data: dict[bytes, bytes] = {
         b"desc": _desc_type("Color Calibrator (matrix)"),
+        b"cprt": _cprt_type("Public Domain"),
         b"wtpt": _xyz_type(*_D50_XYZ),
         b"rXYZ": _xyz_type(*r_xyz_d50),
         b"gXYZ": _xyz_type(*g_xyz_d50),

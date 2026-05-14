@@ -431,4 +431,10 @@ async def run_calibration(
     vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
     icc_bytes = build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
 
+    if not _windows_mode:
+        # Clear any intermediate VideoLUT written during rounds so the display
+        # returns to its native uncorrected state. The final ICC (with its VCGT
+        # tag) is what the user installs; applying it is their explicit action.
+        await asyncio.to_thread(clear_ramp)
+
     return icc_bytes, final_delta_e, lut_r, lut_g, lut_b

@@ -3,206 +3,579 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Color Calibrator — PC</title>
-<link rel="stylesheet" href="/static/style.css">
-</head>
-<body>
+<title>Chroma — Display Calibration</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,300&display=swap"
+  rel="stylesheet">
+<style>
+  :root {
+    --bg: #06090e;
+    --bg-card: #0c1018;
+    --bg-hover: #111820;
+    --border: #1a2332;
+    --border-hi: #263040;
+    --text: #d4e4f4;
+    --text-mid: #7a8ea4;
+    --text-dim: #3a4a5c;
+    --accent: #2de2c4;
+    --accent-glow: rgba(45, 226, 196, 0.18);
+    --accent-dim: rgba(45, 226, 196, 0.07);
+    --amber: #f0a030;
+    --amber-glow: rgba(240, 160, 48, 0.18);
+    --amber-dim: rgba(240, 160, 48, 0.07);
+    --error: #ff4455;
+    --error-dim: rgba(255, 68, 85, 0.07);
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
 
-<!-- Screen 1: Error (dispwin missing) -->
-<div id="s-error" class="screen">
-  <h1>Setup Required</h1>
-  <p class="error-msg" id="error-text"></p>
-  <p>Install <strong>ArgyllCMS</strong> and add <code>dispwin</code> to your PATH:</p>
-  <pre>
-Windows: https://www.argyllcms.com/downloadwin.html
-Mac:     brew install argyllcms
-Linux:   sudo apt install argyll  (or dnf/pacman equivalent)
-  </pre>
-</div>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
-<!-- Screen 2: QR code -->
-<div id="s-qr" class="screen active">
-  <h1>Scan with your phone</h1>
-  <img id="qr-img" class="qr-img" alt="QR code loading…">
-  <p>Open <code id="mobile-url"></code> in your mobile browser, or scan the QR code above.</p>
-  <p>Waiting for mobile to connect…</p>
-</div>
-
-<!-- Screen 3: Setup instructions -->
-<div id="s-setup" class="screen">
-  <h1>Setup</h1>
-  <p>1. Darken the room as much as possible.</p>
-  <p>2. Hold your phone 30 cm from the centre of the screen, perpendicular to it.</p>
-  <p>3. On your phone: tap <strong>Start Camera</strong>, then aim it at the screen.</p>
-  <div style="text-align:left; padding:1rem; background:#1a1a1a; border-radius:6px; width:100%;">
-    <p style="color:#eee; margin-bottom:0.5rem;"><strong>Calibration mode:</strong></p>
-    <label><input type="radio" name="mode" value="gamma" checked> Gamma only (automated, ~2 min)</label><br>
-    <label><input type="radio" name="mode" value="color"> Color (4 manual RAW photos required, ~5 min, ~3 ΔE)</label>
-    <p style="color:#888; font-size:0.85rem; margin-top:0.4rem;">Color mode requires DNG support and sRGB JPEG output. iOS: Settings → Camera → Formats → Most Compatible.</p>
-  </div>
-  <p>4. When ready, click Begin below.</p>
-  <button id="begin-btn">Begin Calibration</button>
-</div>
-
-<!-- Screen 4: Measuring -->
-<div id="s-measuring" class="screen">
-  <h1>Measuring — Round <span id="round-num">1</span> of 3</h1>
-  <p>Patch <span id="patch-num">0</span> of <span id="patch-total">11</span></p>
-  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
-  <div class="ssnr-indicator ssnr-waiting" id="ssnr-badge">Waiting for stable frame…</div>
-</div>
-
-<!-- Screen 5: Applying correction -->
-<div id="s-applying" class="screen">
-  <h1>Applying Correction…</h1>
-  <p>Round <span id="apply-round">1</span> complete. Applying gamma ramp to display.</p>
-</div>
-
-<!-- Screen 6: Result -->
-<div id="s-result" class="screen">
-  <h1>Calibration Complete</h1>
-  <p class="delta-e">ΔE: <span id="delta-e-value">—</span></p>
-  <p>Lower is better. Hardware colorimeters achieve &lt;1 ΔE.</p>
-  <div class="before-after">
-    <div><p>Before</p><img id="before-img" alt="Before" src=""></div>
-    <div><p>After</p><img id="after-img" alt="After" src=""></div>
-  </div>
-  <button id="download-btn">Download .icc Profile</button>
-  <details>
-    <summary>How to install</summary>
-    <pre id="install-instructions"></pre>
-  </details>
-</div>
-
-<script>
-const screens = {
-  error:     document.getElementById('s-error'),
-  qr:        document.getElementById('s-qr'),
-  setup:     document.getElementById('s-setup'),
-  measuring: document.getElementById('s-measuring'),
-  applying:  document.getElementById('s-applying'),
-  result:    document.getElementById('s-result'),
-};
-
-function showScreen(name) {
-  Object.values(screens).forEach(s => s.classList.remove('active'));
-  screens[name].classList.add('active');
+html, body {
+  width: 100%; height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1.6;
+  overflow: hidden;
 }
 
-const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-const ws = new WebSocket(`${wsScheme}//${location.host}/ws/pc`);
+/* spectrum line */
+.spectrum-bar {
+  position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 999;
+  background: linear-gradient(to right,
+    #ff2244 0%, #ff6600 16%, #ffe000 33%,
+    #44ee66 50%, #00aaff 66%, #8844ff 83%, #ff2244 100%);
+}
 
-ws.onmessage = (evt) => {
-  const msg = JSON.parse(evt.data);
+/* dot grid */
+body::before {
+  content: '';
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background-image: radial-gradient(circle, var(--border) 1px, transparent 1px);
+  background-size: 30px 30px;
+  opacity: 0.55;
+}
 
-  if (msg.type === 'error') {
-    document.getElementById('error-text').textContent = msg.message;
-    showScreen('error');
-    return;
-  }
+/* header */
+.app-header {
+  position: fixed; top: 2px; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0.9rem 2rem;
+  z-index: 50; pointer-events: none;
+  border-bottom: 1px solid var(--border);
+  background: rgba(6,9,14,0.7);
+  backdrop-filter: blur(8px);
+}
+.app-name {
+  font-family: var(--mono);
+  font-size: 0.7rem; font-weight: 600;
+  letter-spacing: 0.28em; text-transform: uppercase;
+  color: var(--text-dim);
+}
+.app-name em { color: var(--accent); font-style: normal; }
+.conn-row {
+  display: flex; align-items: center; gap: 0.6rem;
+  font-family: var(--mono); font-size: 0.68rem; color: var(--text-dim);
+}
+.conn-dot {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--text-dim); flex-shrink: 0;
+}
+.conn-dot.pulsing {
+  background: var(--amber);
+  box-shadow: 0 0 8px var(--amber);
+  animation: slow-pulse 1.6s ease-in-out infinite;
+}
+.conn-dot.live {
+  background: var(--accent);
+  box-shadow: 0 0 10px var(--accent);
+  animation: slow-pulse 2.5s ease-in-out infinite;
+}
+@keyframes slow-pulse {
+  0%,100% { opacity: 1; } 50% { opacity: 0.3; }
+}
 
-  if (msg.type === 'qr_code') {
-    document.getElementById('qr-img').src = `data:image/png;base64,${msg.png_b64}`;
-    document.getElementById('mobile-url').textContent = msg.url;
-    showScreen('qr');
-    return;
-  }
+/* screen system */
+.screen {
+  position: fixed; inset: 0; z-index: 1;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+  padding: 5rem 2rem 2rem;
+  opacity: 0; pointer-events: none;
+  transform: translateY(10px);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+.screen.active {
+  opacity: 1; pointer-events: auto; transform: translateY(0);
+}
 
-  if (msg.type === 'mobile_connected') {
-    showScreen('setup');
-    document.getElementById('begin-btn').onclick = () => {
-      const mode = document.querySelector('input[name="mode"]:checked').value;
-      ws.send(JSON.stringify({ type: 'start_calibration', mode: mode }));
-      document.getElementById('begin-btn').disabled = true;
-      document.getElementById('begin-btn').textContent = 'Starting…';
-    };
-    return;
-  }
+/* typography atoms */
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 0.65rem; font-weight: 600;
+  letter-spacing: 0.32em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 0.6rem;
+}
+.big-title {
+  font-family: var(--sans);
+  font-size: 2.1rem; font-weight: 300; color: var(--text);
+  margin-bottom: 0.4rem; letter-spacing: -0.01em;
+}
+.subtext {
+  font-family: var(--mono);
+  font-size: 0.78rem; color: var(--text-dim);
+  margin-bottom: 2.5rem;
+}
 
-  if (msg.type === 'show_patch') {
-    const [r, g, b] = msg.rgb;
-    document.body.style.background = `rgb(${r},${g},${b})`;
-    // Hide all wizard chrome so the camera measures a clean full-screen patch.
-    Object.values(screens).forEach(s => s.classList.remove('active'));
-    return;
-  }
+/* ── QR SCREEN ── */
+.qr-outer {
+  padding: 1.6rem; background: #fff; border-radius: 14px;
+  box-shadow: 0 0 0 1px var(--border), 0 0 80px var(--accent-glow);
+  animation: qr-breathe 3.5s ease-in-out infinite;
+  margin-bottom: 1.5rem;
+}
+@keyframes qr-breathe {
+  0%,100% { box-shadow: 0 0 0 1px var(--border), 0 0 30px var(--accent-glow); }
+  50%      { box-shadow: 0 0 0 1px var(--border-hi), 0 0 90px var(--accent-glow); }
+}
+#qr-img { display: block; width: 190px; height: 190px; }
 
-  if (msg.type === 'patch_done') {
-    document.body.style.background = '#111';
-    document.getElementById('patch-num').textContent = msg.n;
-    document.getElementById('patch-total').textContent = msg.total;
-    const pct = (msg.n / msg.total * 100).toFixed(0);
-    document.getElementById('progress-fill').style.width = pct + '%';
-    if (msg.round && msg.round > 0) {
-      document.getElementById('round-num').textContent = msg.round;
-    }
-    const badge = document.getElementById('ssnr-badge');
-    badge.textContent = 'Captured ✓';
-    badge.className = 'ssnr-indicator ssnr-stable';
-    showScreen('measuring');
-    return;
-  }
+.url-pill {
+  font-family: var(--mono); font-size: 0.76rem;
+  color: var(--text-mid);
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.45rem 1rem;
+  margin-bottom: 1.25rem;
+  max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.waiting-row {
+  font-family: var(--mono); font-size: 0.72rem;
+  color: var(--text-dim); letter-spacing: 0.1em;
+  display: flex; align-items: center; gap: 0.6rem;
+}
+.blink { animation: blink 1.1s step-end infinite; }
+@keyframes blink { 0%,100% { opacity: 1; } 50% { opacity: 0; } }
 
-  if (msg.type === 'holdout_started') {
-    document.querySelector('#s-measuring h1').textContent = 'Verifying Calibration';
-    document.getElementById('patch-total').textContent = msg.total;
-    document.getElementById('progress-fill').style.width = '0%';
-    showScreen('measuring');
-    return;
-  }
+/* ── SETUP SCREEN ── */
+.steps-list {
+  width: 100%; max-width: 520px;
+  display: flex; flex-direction: column; gap: 0.6rem;
+  margin-bottom: 1.5rem;
+}
+.step-row {
+  display: flex; align-items: flex-start; gap: 1rem;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 0.9rem 1.2rem;
+  transition: border-color 0.2s;
+}
+.step-row:hover { border-color: var(--border-hi); }
+.step-n {
+  font-family: var(--mono); font-size: 0.65rem; font-weight: 600;
+  color: var(--accent); letter-spacing: 0.08em; padding-top: 0.1rem;
+  flex-shrink: 0; width: 1.8rem;
+}
+.step-body { font-size: 0.88rem; color: var(--text); line-height: 1.5; }
+.step-body strong { font-weight: 500; color: var(--text); }
 
-  if (msg.type === 'capturing') {
-    // Keep wizard chrome hidden during capture so the patch fills the screen.
-    document.getElementById('round-num').textContent = msg.round;
-    const badge = document.getElementById('ssnr-badge');
-    badge.textContent = 'Waiting for stable frame…';
-    badge.className = 'ssnr-indicator ssnr-waiting';
-    return;
-  }
+.mode-row {
+  display: flex; gap: 0.75rem;
+  width: 100%; max-width: 520px; margin-bottom: 1.5rem;
+}
+.mode-card {
+  flex: 1; background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 1rem 1.2rem; cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  position: relative; overflow: hidden;
+}
+.mode-card input[type=radio] { position: absolute; opacity: 0; pointer-events: none; }
+.mode-card:has(input:checked) {
+  border-color: var(--accent); background: var(--accent-dim);
+}
+.mode-badge {
+  display: inline-block; font-family: var(--mono);
+  font-size: 0.6rem; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; padding: 0.15rem 0.55rem;
+  border-radius: 20px; margin-bottom: 0.5rem;
+  background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent);
+}
+.mode-badge.amber { background: var(--amber-dim); color: var(--amber); border-color: var(--amber); }
+.mode-title { font-family: var(--mono); font-size: 0.82rem; font-weight: 600; color: var(--text); margin-bottom: 0.3rem; }
+.mode-desc { font-size: 0.78rem; color: var(--text-mid); line-height: 1.5; }
 
-  if (msg.type === 'round_done') {
-    document.getElementById('apply-round').textContent = msg.round;
-    showScreen('applying');
-    return;
-  }
+/* ── BUTTON ── */
+.btn {
+  position: relative; overflow: hidden;
+  font-family: var(--mono); font-size: 0.78rem;
+  font-weight: 600; letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 0.8rem 2.2rem;
+  border: 1px solid var(--accent); border-radius: 6px;
+  background: transparent; color: var(--accent); cursor: pointer;
+  transition: color 0.22s, box-shadow 0.22s;
+  z-index: 0;
+}
+.btn::after {
+  content: ''; position: absolute; inset: 0; z-index: -1;
+  background: var(--accent);
+  transform: scaleX(0); transform-origin: left;
+  transition: transform 0.22s ease;
+}
+.btn:hover { color: var(--bg); box-shadow: 0 0 28px var(--accent-glow); }
+.btn:hover::after { transform: scaleX(1); }
+.btn:disabled { opacity: 0.35; cursor: not-allowed; pointer-events: none; }
+.btn.solid { background: var(--accent); color: var(--bg); }
+.btn.solid::after { background: #fff; }
+.btn.solid:hover { color: var(--bg); }
 
-  if (msg.type === 'result') {
-    document.body.style.background = '#111';
-    document.body.style.color = '#eee';
-    const dEl = document.getElementById('delta-e-value');
-    if (msg.mode === 'color') {
-      // Color mode has no ΔE; relabel the line entirely.
-      dEl.parentElement.textContent = 'Color profile generated';
-    } else {
-      dEl.textContent = (msg.delta_e ?? 0).toFixed(2);
-    }
-    if (msg.before_b64) document.getElementById('before-img').src = `data:image/png;base64,${msg.before_b64}`;
-    if (msg.after_b64)  document.getElementById('after-img').src  = `data:image/png;base64,${msg.after_b64}`;
+/* ── MEASURING SCREEN ── */
+.round-tag {
+  font-family: var(--mono); font-size: 0.65rem;
+  letter-spacing: 0.28em; text-transform: uppercase;
+  color: var(--accent); margin-bottom: 0.5rem;
+}
+.patch-num-display {
+  font-family: var(--mono); font-size: 4rem; font-weight: 400;
+  letter-spacing: -0.03em; line-height: 1; margin-bottom: 0.25rem;
+  color: var(--text);
+}
+.patch-num-display .denom { color: var(--text-dim); font-size: 2.5rem; }
+.patch-num-label {
+  font-family: var(--mono); font-size: 0.68rem;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--text-dim); margin-bottom: 2rem;
+}
 
-    const iccBytes = Uint8Array.from(atob(msg.icc_b64), c => c.charCodeAt(0));
-    const blob = new Blob([iccBytes], { type: 'application/vnd.iccprofile' });
-    const url  = URL.createObjectURL(blob);
-    const btn  = document.getElementById('download-btn');
-    btn.onclick = () => { const a = document.createElement('a'); a.href = url; a.download = 'color-calibrator.icc'; a.click(); };
+.tile-row { display: flex; gap: 5px; margin-bottom: 2rem; }
+.pt {
+  width: 30px; height: 44px; border-radius: 5px;
+  border: 1px solid var(--border); background: transparent;
+  transition: background 0.5s ease, border-color 0.4s, box-shadow 0.4s;
+  position: relative; overflow: hidden;
+}
+.pt.current { border-color: var(--accent); box-shadow: 0 0 14px var(--accent-glow); }
+.pt.current::after {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(180deg, rgba(255,255,255,0.2) 0%, transparent 60%);
+  animation: scan-line 0.9s linear infinite;
+}
+@keyframes scan-line {
+  0%   { transform: translateY(-100%); }
+  100% { transform: translateY(200%); }
+}
+.pt.captured { border-color: transparent; }
 
-    document.getElementById('install-instructions').textContent = `Windows:
-  1. Double-click color-calibrator.icc → Install Profile
-  2. Win+R → colorcpl → Devices tab → select display
-  3. Tick "Use my settings for this device" → Set as default
+.ssnr-row {
+  display: flex; align-items: center; gap: 0.8rem;
+  font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim);
+}
+.ssnr-pips { display: flex; gap: 5px; }
+.pip {
+  width: 8px; height: 8px; border-radius: 2px;
+  background: var(--border); transition: background 0.25s, box-shadow 0.25s;
+}
+.pip.amber { background: var(--amber); box-shadow: 0 0 8px var(--amber-glow); animation: pip-bounce 0.4s ease-in-out infinite alternate; }
+.pip.teal  { background: var(--accent); box-shadow: 0 0 8px var(--accent-glow); animation: none; }
+@keyframes pip-bounce { from { opacity: 0.5; } to { opacity: 1; } }
 
-Mac:
-  Double-click .icc → ColorSync Utility installs and activates automatically.
+/* ── APPLYING SCREEN ── */
+.spin-ring {
+  width: 56px; height: 56px;
+  border: 2px solid var(--border-hi);
+  border-top-color: var(--accent); border-right-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.9s linear infinite;
+  margin-bottom: 1.75rem;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.apply-tag {
+  font-family: var(--mono); font-size: 0.65rem;
+  letter-spacing: 0.28em; text-transform: uppercase; color: var(--accent);
+}
+.apply-sub {
+  margin-top: 0.5rem; font-size: 0.85rem; color: var(--text-dim);
+}
 
-Linux (X11):
-  xcalib color-calibrator.icc
-  or copy to ~/.local/share/icc/ and activate via display settings.
+/* ── RESULT SCREEN ── */
+.result-wrap {
+  display: flex; gap: 3.5rem; align-items: flex-start;
+  width: 100%; max-width: 860px;
+}
+.result-left { flex: 0 0 auto; min-width: 200px; }
+.result-right { flex: 1; min-width: 0; }
 
-Linux (Wayland):
-  Copy to ~/.local/share/icc/, then: colormgr device-set-property ... Colorspace <profile-id>`;
+.de-number {
+  font-family: var(--mono); font-size: 5.5rem; font-weight: 400;
+  letter-spacing: -0.04em; line-height: 1;
+  color: var(--accent); text-shadow: 0 0 50px var(--accent-glow);
+  margin-bottom: 0.2rem;
+}
+.de-unit {
+  font-family: var(--mono); font-size: 0.68rem;
+  letter-spacing: 0.25em; text-transform: uppercase;
+  color: var(--text-dim); margin-bottom: 0.6rem;
+}
+.de-grade {
+  display: inline-block;
+  font-family: var(--mono); font-size: 0.65rem; font-weight: 600;
+  letter-spacing: 0.18em; text-transform: uppercase;
+  padding: 0.22rem 0.7rem; border-radius: 20px;
+  margin-bottom: 1.25rem;
+}
+.grade-a { background: var(--accent-dim); color: var(--accent); border: 1px solid var(--accent); }
+.grade-b { background: var(--amber-dim);  color: var(--amber);  border: 1px solid var(--amber); }
+.grade-c { background: var(--error-dim);  color: var(--error);  border: 1px solid var(--error); }
 
-    showScreen('result');
-  }
-};
-</script>
+.de-note {
+  font-size: 0.78rem; color: var(--text-dim);
+  line-height: 1.6; max-width: 210px; margin-bottom: 1.5rem;
+}
+
+.comparison-wrap {
+  border: 1px solid var(--border); border-radius: 10px;
+  overflow: hidden; display: flex; margin-bottom: 1.25rem;
+}
+.cmp-half { flex: 1; position: relative; }
+.cmp-half img { width: 100%; height: auto; display: block; }
+.cmp-label {
+  position: absolute; bottom: 0; left: 0; right: 0;
+  font-family: var(--mono); font-size: 0.6rem;
+  letter-spacing: 0.15em; text-transform: uppercase; text-align: center;
+  padding: 0.4rem;
+  background: rgba(6,9,14,0.82); color: var(--text-dim);
+}
+.cmp-divider { width: 1px; background: var(--border); flex-shrink: 0; }
+
+.section-label {
+  font-family: var(--mono); font-size: 0.62rem;
+  letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--text-dim); margin-bottom: 0.5rem;
+}
+
+.install-toggle {
+  font-family: var(--mono); font-size: 0.7rem;
+  color: var(--text-dim); letter-spacing: 0.1em; text-transform: uppercase;
+  background: none; border: none; cursor: pointer; padding: 0;
+  display: flex; align-items: center; gap: 0.4rem;
+  transition: color 0.2s;
+  margin-top: 0.75rem;
+}
+.install-toggle:hover { color: var(--text); }
+.install-toggle .chevron { transition: transform 0.2s; display: inline-block; }
+.install-toggle.open .chevron { transform: rotate(90deg); }
+.install-box {
+  display: none; margin-top: 0.75rem;
+  font-family: var(--mono); font-size: 0.76rem;
+  color: var(--text-mid); line-height: 1.9;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 8px; padding: 1rem 1.2rem;
+}
+.install-box strong { color: var(--text); font-weight: 600; }
+
+/* ── ERROR SCREEN ── */
+.error-card {
+  max-width: 500px; width: 100%;
+  background: var(--error-dim); border: 1px solid rgba(255,68,85,0.3);
+  border-radius: 12px; padding: 2rem; text-align: left;
+}
+.error-eyebrow {
+  font-family: var(--mono); font-size: 0.65rem;
+  letter-spacing: 0.28em; text-transform: uppercase;
+  color: var(--error); margin-bottom: 0.6rem;
+}
+.error-body {
+  font-family: var(--mono); font-size: 0.82rem;
+  color: var(--text); margin-bottom: 1.25rem;
+  word-break: break-all; line-height: 1.6;
+}
+.error-hint {
+  font-size: 0.85rem; color: var(--text-mid); line-height: 1.7;
+}
+.error-hint a { color: var(--accent); text-decoration: none; }
+.error-code {
+  font-family: var(--mono); font-size: 0.75rem; color: var(--text-mid);
+  background: rgba(0,0,0,0.4); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.75rem 1rem;
+  margin-top: 0.75rem; line-height: 1.9;
+}
+
+/* responsive result */
+@media (max-width: 640px) {
+  .result-wrap { flex-direction: column; gap: 2rem; }
+  .result-left { min-width: 0; }
+  .de-number { font-size: 4rem; }
+}
+</style>
+</head>
+
+<body>
+  <div class="spectrum-bar"></div>
+
+  <header class="app-header">
+    <span class="app-name"><em>Chroma</em> &nbsp;/&nbsp; Display Calibration</span>
+    <div class="conn-row">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-label">connecting</span>
+    </div>
+  </header>
+
+  <!-- ERROR -->
+  <div id="s-error" class="screen">
+    <div class="error-card">
+      <div class="error-eyebrow">Setup Required</div>
+      <div class="error-body" id="error-text"></div>
+      <div class="error-hint">
+        Install <strong>ArgyllCMS</strong> and add <code>dispwin</code> to your PATH:
+        <div class="error-code">
+          <span>Windows → <a href="https://www.argyllcms.com/downloadwin.html"
+              target="_blank">argyllcms.com/downloadwin</a></span><br></span>
+          <span>Mac → <code>brew install argyllcms</code><br></span>
+          <span>Linux → <code>sudo apt install argyll</code><br></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+<!-- QR -->
+<div id="s-qr" class="screen active">
+  <div class="eyebrow">Step 01</div>
+  <div class="big-title">Connect your phone</div>
+  <div class="subtext">Scan the QR code or open the URL in your mobile browser</div>
+  <div class="qr-outer">
+    <img id="qr-img" width="190" height="190" alt="QR code">
+  </div>
+  <div class="url-pill" id="mobile-url">Loading…</div>
+  <div class="waiting-row">
+    <span class="conn-dot pulsing"></span>
+    <span>Waiting for mobile to connect<span class="blink">_</span></span>
+  </div>
+</div>
+
+<!-- SETUP -->
+<div id="s-setup" class="screen">
+  <div class="eyebrow">Step 02</div>
+  <div class="big-title" style="margin-bottom:1.5rem">Prepare your environment</div>
+  <div class="steps-list">
+    <div class="step-row">
+      <div class="step-n">01</div>
+      <div class="step-body">Darken the room — ambient light reduces accuracy significantly.</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">02</div>
+      <div class="step-body">Hold your phone <strong>~30 cm</strong> from the screen centre, perpendicular to it. Keep
+        it still.</div>
+    </div>
+    <div class="step-row">
+      <div class="step-n">03</div>
+      <div class="step-body">When the screen turns white, <strong>lock exposure and white balance</strong> on your phone
+        camera, then tap Ready.</div>
+    </div>
+  </div>
+  <div class="mode-row">
+    <label class="mode-card">
+      <input type="radio" name="mode" value="gamma" checked>
+      <div class="mode-badge">Recommended</div>
+      <div class="mode-title">Gamma Mode</div>
+      <div class="mode-desc">Automated · ~2 min<br>11 patches · fixes gamma + gray balance</div>
+    </label>
+    <label class="mode-card">
+      <input type="radio" name="mode" value="color">
+      <div class="mode-badge amber">Requires DNG</div>
+      <div class="mode-title">Color Mode</div>
+      <div class="mode-desc">~5 min · 4 RAW photos + 33 patches<br>Extends to white point + primaries</div>
+    </label>
+  </div>
+  <button class="btn solid" id="begin-btn">Begin Calibration</button>
+</div>
+
+<!-- MEASURING -->
+<div id="s-measuring" class="screen">
+  <div class="round-tag" id="round-tag">Round 1 of 3</div>
+  <div class="patch-num-display">
+    <span id="patch-num">0</span><span class="denom"> / <span id="patch-total">11</span></span>
+  </div>
+  <div class="patch-num-label">patches captured</div>
+  <div class="tile-row" id="tile-row"></div>
+  <div class="ssnr-row">
+    <div class="ssnr-pips" id="ssnr-pips">
+      <div class="pip"></div>
+      <div class="pip"></div>
+      <div class="pip"></div>
+      <div class="pip"></div>
+      <div class="pip"></div>
+    </div>
+    <span id="ssnr-text">Waiting for stable frame</span>
+  </div>
+</div>
+
+<!-- APPLYING -->
+<div id="s-applying" class="screen">
+  <div class="spin-ring"></div>
+  <div class="apply-tag">Applying Correction</div>
+  <div class="apply-sub">Round <span id="apply-round">1</span> complete — loading gamma ramp to display</div>
+</div>
+
+<!-- RESULT -->
+<div id="s-result" class="screen">
+  <div class="result-wrap">
+    <div class="result-left">
+      <div class="eyebrow">Result</div>
+      <div class="de-number" id="de-number">—</div>
+      <div class="de-unit">Delta‑E (ΔE)</div>
+      <div class="de-grade" id="de-grade"></div>
+      <p class="de-note" id="de-note">Lower is better. Hardware colorimeters achieve &lt;1 ΔE.</p>
+      <div id="fail-banner" hidden style="
+        font-family:var(--mono); font-size:0.74rem; line-height:1.65;
+        background:var(--error-dim); border:1px solid rgba(255,68,85,0.35);
+        border-radius:8px; padding:0.85rem 1rem; color:var(--error);
+        margin-bottom:1rem;">
+        Measurement failed — do not install this profile.<br>
+        <span style="color:var(--text-mid)">
+          Ensure the room is dark, phone is held ~30 cm from the screen
+          centre and perfectly still, and camera exposure is not locked to a
+          bright value. Then restart and try again.
+        </span>
+      </div>
+      <button class="btn solid" id="download-btn" style="width:100%; margin-bottom:0.5rem">Download .icc
+        Profile</button>
+      <button class="install-toggle" id="install-toggle">
+        <span class="chevron">›</span> Install instructions
+      </button>
+      <div class="install-box" id="install-box">
+        <strong>Windows</strong><br>
+        Right-click .icc → Install Profile<br>
+        Win+R → colorcpl → Devices tab → select display<br>
+        Tick "Use my settings for this device" → Set as default<br><br>
+        <strong>Mac</strong><br>
+        System Settings → Displays → select display → Color Profile<br>
+        Click the dropdown → "Customise…" → + → pick the .icc file<br>
+        Or apply immediately (temporary, resets on logout):<br>
+        <code>dispwin -d1 color-calibrator.icc</code><br><br>
+        <strong>Linux (X11)</strong><br>
+        <code>dispwin -d1 color-calibrator.icc</code> (temporary)<br>
+        <code>dispwin -d1 -I color-calibrator.icc</code> (permanent)<br><br>
+        <strong>Linux (Wayland)</strong><br>
+        Copy to ~/.local/share/icc/ → activate via colormgr
+      </div>
+    </div>
+    <div class="result-right">
+      <div class="section-label">Before / After</div>
+      <div class="comparison-wrap">
+        <div class="cmp-half">
+          <img id="before-img" alt="Before">
+          <div class="cmp-label">Before</div>
+        </div>
+        <div class="cmp-divider"></div>
+        <div class="cmp-half">
+          <img id="after-img" alt="After">
+          <div class="cmp-label">After</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="/static/pc.js" defer></script>
 </body>
 </html>
