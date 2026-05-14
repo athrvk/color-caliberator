@@ -466,7 +466,13 @@ async def _run_calibration_task() -> None:
                 "after_b64": after_b64,
                 "live_preview": True,
             })
-            await _send(mobile.ws, {"type": "all_done"})
+            # Use the indirect resolver — mobile may have reconnected since
+            # the task started so a snapshot would be stale.
+            try:
+                done_mobile = await _current_mobile()
+                await _send(done_mobile.ws, {"type": "all_done"})
+            except Exception:
+                log.info("could not notify mobile of all_done (likely disconnected)")
         except Exception as exc:
             log.exception("calibration task failed")
             # Best-effort: reset the VideoLUT to identity so a partial bad
