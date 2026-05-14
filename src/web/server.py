@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -42,6 +42,12 @@ class Session:
         self.mobile: Endpoint | None = None
         self.calibration_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
+        self.mode: str = "gamma"
+        self.anchors: dict[int, bytes] = {}
+        self.anchor_events: dict[int, asyncio.Event] = {
+            0: asyncio.Event(), 1: asyncio.Event(),
+            2: asyncio.Event(), 3: asyncio.Event(),
+        }
 
 
 session = Session()
@@ -125,6 +131,10 @@ async def _pc_control_loop(pc: "Endpoint") -> None:
                     continue
                 if session.calibration_task and not session.calibration_task.done():
                     continue  # already running
+                session.mode = msg.get("mode", "gamma")
+                session.anchors.clear()
+                for ev in session.anchor_events.values():
+                    ev.clear()
                 session.calibration_task = asyncio.create_task(_run_calibration_task())
 
 
@@ -153,6 +163,21 @@ async def ws_mobile(websocket: WebSocket):
                 session.mobile = None
         if pc is not None and not pc.closed.is_set():
             await _send(pc.ws, {"type": "error", "message": "Mobile disconnected."})
+
+
+@app.post("/upload/raw/{seq}")
+async def upload_raw(seq: int, file: UploadFile = File(...)):
+    if seq < 0 or seq > 3:
+        raise HTTPException(status_code=400, detail="seq must be in [0, 3]")
+    data = await file.read()
+    if len(data) < 1024:
+        raise HTTPException(status_code=400, detail="file too small to be a DNG")
+    async with session.lock:
+        session.anchors[seq] = data
+        event = session.anchor_events.get(seq)
+    if event is not None:
+        event.set()
+    return {"ok": True, "seq": seq, "bytes": len(data)}
 
 
 # ---------- Helpers ----------
@@ -218,6 +243,23 @@ async def _run_calibration_task() -> None:
         """Discard any queued mobile messages (stale frames between patches)."""
         while not mobile.queue.empty():
             mobile.queue.get_nowait()
+
+    async def wait_for_anchor(seq: int) -> bytes:
+        # Fast-path: if the upload already landed, return immediately.
+        async with session.lock:
+            cached = session.anchors.get(seq)
+        if cached is not None:
+            return cached
+        event = session.anchor_events[seq]
+        try:
+            await asyncio.wait_for(event.wait(), timeout=300.0)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(f"Timed out waiting for RAW upload seq={seq}") from exc
+        async with session.lock:
+            data = session.anchors.get(seq)
+        if data is None:
+            raise RuntimeError(f"Anchor seq={seq} event set but data missing")
+        return data
 
     import tempfile
     from pathlib import Path
