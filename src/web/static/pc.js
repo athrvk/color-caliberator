@@ -290,4 +290,15 @@ ws.onmessage = ({ data }) => {
     setTimeout(() => { btn.disabled = false; btn.textContent = 'Reset Display Gamma'; }, 2000);
     return;
   }
+
+  if (msg.type === 'mobile_disconnected_soft') {
+    // Calibration is paused waiting for mobile to come back. Don't navigate.
+    setConn('pulsing', 'mobile reconnecting…');
+    return;
+  }
+
+  if (msg.type === 'mobile_reconnected') {
+    setConn('live', 'mobile connected');
+    return;
+  }
 };

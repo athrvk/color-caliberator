@@ -54,6 +54,10 @@ class Session:
             0: asyncio.Event(), 1: asyncio.Event(),
             2: asyncio.Event(), 3: asyncio.Event(),
         }
+        # Fired when a new mobile endpoint registers. Lets a running
+        # calibration task wait for iOS-style suspend/resume reconnects
+        # without dying just because the old WS got torn down.
+        self.mobile_reconnect_event: asyncio.Event = asyncio.Event()
         # Final corrected LUTs after calibration completes. Lets the PC result
         # screen flip the live VideoLUT between corrected/original for a
         # whole-desktop before/after preview (TruHu-style).
@@ -177,13 +181,21 @@ async def ws_mobile(websocket: WebSocket):
     await websocket.accept()
     endpoint = Endpoint(websocket)
     async with session.lock:
+        is_reconnect = (
+            session.calibration_task is not None
+            and not session.calibration_task.done()
+        )
         session.mobile = endpoint
         pc = session.pc
+        # Wake any calibration coroutine that was waiting on a mobile_recv.
+        session.mobile_reconnect_event.set()
 
     if pc is not None:
-        await _send(pc.ws, {"type": "mobile_connected"})
-        # PC's setup screen now shows a Begin button; calibration starts when
-        # the user clicks it (PC sends `start_calibration`).
+        if is_reconnect:
+            # Calibration is in progress — this is a resume, not a fresh start.
+            await _send(pc.ws, {"type": "mobile_reconnected"})
+        else:
+            await _send(pc.ws, {"type": "mobile_connected"})
 
     reader = asyncio.create_task(_reader(endpoint))
     try:
@@ -193,8 +205,21 @@ async def ws_mobile(websocket: WebSocket):
         async with session.lock:
             if session.mobile is endpoint:
                 session.mobile = None
+            calibration_active = (
+                session.calibration_task is not None
+                and not session.calibration_task.done()
+            )
         if pc is not None and not pc.closed.is_set():
-            await _send(pc.ws, {"type": "error", "kind": "mobile_disconnected", "message": "Mobile disconnected."})
+            if calibration_active:
+                # Soft notification — calibration will wait for reconnect, not
+                # crash. PC shows a banner instead of error screen.
+                await _send(pc.ws, {"type": "mobile_disconnected_soft"})
+            else:
+                await _send(pc.ws, {
+                    "type": "error",
+                    "kind": "mobile_disconnected",
+                    "message": "Mobile disconnected.",
+                })
 
 
 @app.post("/reset_display")
@@ -298,36 +323,74 @@ async def _run_calibration_task() -> None:
     """Wraps calibration loop; sends result or error to PC."""
     from calibration.iterate import run_calibration
 
-    pc, mobile = session.pc, session.mobile
-    if pc is None or mobile is None:
+    pc = session.pc
+    if pc is None or session.mobile is None:
         return
     mode = session.mode
+
+    # Time we'll wait for mobile to reconnect after a disconnect mid-calibration
+    # (iOS users routinely background Chrome to use the native Camera for
+    # AE/AF lock — Safari engine drops the WS within ~30s of backgrounding).
+    MOBILE_RECONNECT_TIMEOUT = 120.0
+
+    async def _current_mobile() -> "Endpoint":
+        """Return the live mobile Endpoint, waiting for reconnect if needed."""
+        while True:
+            m = session.mobile
+            if m is not None and not m.closed.is_set():
+                return m
+            log.info("calibration paused — waiting for mobile reconnect")
+            session.mobile_reconnect_event.clear()
+            try:
+                await asyncio.wait_for(
+                    session.mobile_reconnect_event.wait(),
+                    timeout=MOBILE_RECONNECT_TIMEOUT,
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"Mobile disconnected for >{int(MOBILE_RECONNECT_TIMEOUT)}s. Restart."
+                ) from exc
 
     async def pc_send(msg: dict) -> None:
         await _send(pc.ws, msg)
 
     async def mobile_send(msg: dict) -> None:
-        await _send(mobile.ws, msg)
+        m = await _current_mobile()
+        if not await _send(m.ws, msg):
+            # Send failed mid-flight (peer closed during await) — retry after
+            # next reconnect. One re-attempt is enough; if it fails again,
+            # _current_mobile's timeout governs.
+            m = await _current_mobile()
+            await _send(m.ws, msg)
 
     async def mobile_recv() -> dict:
-        # Race the queue read against mobile.closed so a disconnected mobile
-        # surfaces immediately instead of relying on 10s/180s/300s timeouts
-        # in iterate.py to fire one at a time.
-        get_task = asyncio.create_task(mobile.queue.get())
-        close_task = asyncio.create_task(mobile.closed.wait())
-        done, pending = await asyncio.wait(
-            {get_task, close_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
-        if get_task in done and not get_task.cancelled():
-            return get_task.result()
-        raise RuntimeError("Mobile disconnected during capture.")
+        # Race the queue read against the current mobile's closed event AND
+        # against a reconnect signal. On disconnect, loop and try again with
+        # the new mobile endpoint.
+        while True:
+            m = await _current_mobile()
+            session.mobile_reconnect_event.clear()
+            get_task     = asyncio.create_task(m.queue.get())
+            close_task   = asyncio.create_task(m.closed.wait())
+            recon_task   = asyncio.create_task(session.mobile_reconnect_event.wait())
+            done, pending = await asyncio.wait(
+                {get_task, close_task, recon_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for t in pending:
+                t.cancel()
+            if get_task in done and not get_task.cancelled():
+                return get_task.result()
+            # Either current mobile closed or a new one arrived. Loop and
+            # bind to the latest session.mobile.
 
     async def mobile_drain() -> None:
         """Discard any queued mobile messages (stale frames between patches)."""
-        while not mobile.queue.empty():
-            mobile.queue.get_nowait()
+        m = session.mobile
+        if m is None:
+            return
+        while not m.queue.empty():
+            m.queue.get_nowait()
 
     async def wait_for_anchor(seq: int) -> bytes:
         # Fast-path: if the upload already landed, return immediately.

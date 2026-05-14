@@ -107,11 +107,30 @@ async function lockCamera() {
 
 startCamBtn.onclick = startCamera;
 
-// ── WebSocket ──
+// ── WebSocket with auto-reconnect ──
+let reconnectAttempt = 0;
+let reconnectTimer  = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  // Exponential backoff capped at 4s. We want fast reconnect on iOS resume.
+  const delay = Math.min(250 * Math.pow(1.6, reconnectAttempt), 4000);
+  reconnectAttempt++;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (!ws || ws.readyState === WebSocket.CLOSED) connectWs();
+  }, delay);
+}
+
 function connectWs() {
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${scheme}//${location.host}/ws/mobile`);
-  ws.onopen    = () => { connDot.classList.add('live'); setStatus('Connected — waiting for PC…'); };
+  ws.onopen = () => {
+    reconnectAttempt = 0;
+    connDot.classList.add('live');
+    setStatus('Connected — waiting for PC…');
+  };
   ws.onmessage = (evt) => {
     let msg;
     try { msg = JSON.parse(evt.data); }
@@ -119,17 +138,31 @@ function connectWs() {
     try { handleMsg(msg); }
     catch (e) { console.error('handleMsg crashed', e); }
   };
-  ws.onclose   = () => { connDot.classList.remove('live'); stopCapturing(); setStatus('Disconnected. Reload to reconnect.'); };
-  ws.onerror   = (e) => { console.warn('mobile WS error', e); };
+  ws.onclose = () => {
+    connDot.classList.remove('live');
+    stopCapturing();
+    setStatus('Reconnecting…');
+    scheduleReconnect();
+  };
+  ws.onerror = (e) => { console.warn('mobile WS error', e); };
 }
 
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' &&
-      ws && (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING)) {
+// iOS Safari/Chrome suspends JS when the page is backgrounded. When the user
+// returns from the native Camera app the WS may already be dead. Multiple
+// signals can fire on resume — visibilitychange, pageshow, focus, online.
+// Treat any of them as "try to reconnect now if needed".
+function reconnectIfDead() {
+  if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
     setStatus('Reconnecting…');
     connectWs();
   }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') reconnectIfDead();
 });
+window.addEventListener('pageshow', reconnectIfDead);
+window.addEventListener('focus',    reconnectIfDead);
+window.addEventListener('online',   reconnectIfDead);
 
 // ── Message handler ──
 function handleMsg(msg) {
