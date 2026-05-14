@@ -171,7 +171,7 @@ function handleMsg(msg) {
   }
 
   if (msg.type === 'all_done') {
-    doneScreen.style.display = 'flex';
+    doneScreen.classList.add('show');
   }
 }
 

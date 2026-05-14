@@ -403,8 +403,28 @@ body::before {
 /* responsive result */
 @media (max-width: 640px) {
   .result-wrap { flex-direction: column; gap: 2rem; }
-  .result-left { min-width: 0; }
+  .result-left { flex: 1 1 auto; max-width: none; min-width: 0; width: 100%; }
   .de-number { font-size: 4rem; }
+  .mode-row { flex-direction: column; }
+}
+
+/* allow scrolling on screens whose content overflows the viewport — the
+   .screen container is position:fixed inset:0, so content gets clipped
+   unless we explicitly allow overflow on screens that can grow tall. */
+#s-result.screen {
+  justify-content: flex-start;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+#s-setup.screen { overflow-y: auto; justify-content: flex-start; padding-top: 6rem; -webkit-overflow-scrolling: touch; }
+
+/* respect user motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 </style>
 </head>
@@ -426,12 +446,12 @@ body::before {
       <div class="error-eyebrow">Setup Required</div>
       <div class="error-body" id="error-text"></div>
       <div class="error-hint">
-        Install <strong>ArgyllCMS</strong> and add <code>dispwin</code> to your PATH:
+        macOS and Windows use native VideoLUT APIs — no extra install needed.
+        Linux needs <strong>ArgyllCMS</strong> (provides <code>dispwin</code>):
         <div class="error-code">
-          <span>Windows → <a href="https://www.argyllcms.com/downloadwin.html"
-              target="_blank">argyllcms.com/downloadwin</a></span><br></span>
-          <span>Mac → <code>brew install argyll-cms</code><br></span>
-          <span>Linux → <code>sudo apt install argyll</code><br></span>
+          <span>Linux → <code>sudo apt install argyll</code> (or distro equivalent)</span><br>
+          <span>Wayland → unsupported; log into an X11 session</span><br>
+          <span>Docs → <a href="https://www.argyllcms.com/" target="_blank" rel="noopener noreferrer">argyllcms.com</a></span>
         </div>
       </div>
     </div>
