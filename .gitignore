@@ -2,6 +2,7 @@
 .worktrees/
 .cert/
 src/web/static/test_chart.png
+tests/fixtures/*.dng
 
 # Python
 __pycache__/
