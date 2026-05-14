@@ -147,7 +147,7 @@ Apple TV Color Balance uses internally with iPhone sensors.
 | TLS | Self-signed cert via `cryptography`, auto-regen on LAN-IP change |
 | Mobile | Plain HTML/JS, `getUserMedia`, JPEG frames at 5 fps over WS |
 | QR | `qrcode[pil]` |
-| Tests | pytest + pytest-asyncio (37 tests) |
+| Tests | pytest + pytest-asyncio (49 tests) |
 
 ### Architecture in 30 seconds
 
@@ -168,7 +168,7 @@ src/web/
   server.py                   # FastAPI app + WebSocket session
   static/pc.html              # PC wizard
   static/mobile.html          # Mobile camera page
-tests/                        # 37 tests, all green
+tests/                        # 49 tests, all green
 ```
 
 ### Key design notes for contributors

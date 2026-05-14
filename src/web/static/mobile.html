@@ -105,7 +105,6 @@ function connectWs() {
           }
           status.textContent = `Uploaded ${file.name}. Waiting for next instruction…`;
           uploadBtn.style.display = 'none';
-          ws.send(JSON.stringify({ type: 'raw_uploaded', seq: msg.seq }));
         };
         xhr.onerror = () => { status.textContent = 'Upload failed: network error'; };
         xhr.send(form);
@@ -167,14 +166,6 @@ function connectWs() {
     status.textContent = 'Disconnected. Reload to reconnect.';
   };
 }
-
-let lastWsUrl = null;
-const origConnect = connectWs;
-connectWs = function () {
-  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  lastWsUrl = `${wsScheme}//${location.host}/ws/mobile`;
-  origConnect();
-};
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible'
