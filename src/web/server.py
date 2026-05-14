@@ -1,12 +1,18 @@
 import asyncio
 import base64
 import json
+import logging
 import sys
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+
+log = logging.getLogger("color-calibrator")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+
+MAX_RAW_UPLOAD_BYTES = 200 * 1024 * 1024  # 200 MB — bigger than any phone DNG
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -65,10 +71,15 @@ async def _reader(endpoint: Endpoint) -> None:
             try:
                 msg = json.loads(text)
             except json.JSONDecodeError:
+                log.warning("ignored non-JSON WS frame (%d bytes)", len(text))
                 continue
             await endpoint.queue.put(msg)
     except WebSocketDisconnect:
         pass
+    except Exception:
+        # Catch-all so the reader task always sets `closed` and never escapes
+        # silently into the asyncio task graveyard.
+        log.exception("WS reader crashed")
     finally:
         endpoint.closed.set()
 
@@ -137,6 +148,7 @@ async def _pc_control_loop(pc: "Endpoint") -> None:
                     continue  # already running
                 session.mode = msg.get("mode", "gamma")
                 session.anchors.clear()
+                session.final_luts = ()  # invalidate stale preview LUTs
                 for ev in session.anchor_events.values():
                     ev.clear()
                 session.calibration_task = asyncio.create_task(_run_calibration_task())
@@ -186,7 +198,21 @@ async def ws_mobile(websocket: WebSocket):
 async def upload_raw(seq: int, file: UploadFile = File(...)):
     if seq < 0 or seq > 3:
         raise HTTPException(status_code=400, detail="seq must be in [0, 3]")
-    data = await file.read()
+    # Stream-read with a hard cap so a malicious POST can't OOM the server.
+    chunks: list[bytes] = []
+    size = 0
+    while True:
+        chunk = await file.read(1024 * 1024)
+        if not chunk:
+            break
+        size += len(chunk)
+        if size > MAX_RAW_UPLOAD_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"upload exceeds {MAX_RAW_UPLOAD_BYTES // (1024 * 1024)} MB cap",
+            )
+        chunks.append(chunk)
+    data = b"".join(chunks)
     if len(data) < 1024:
         raise HTTPException(status_code=400, detail="file too small to be a DNG")
     async with session.lock:
@@ -194,13 +220,25 @@ async def upload_raw(seq: int, file: UploadFile = File(...)):
         event = session.anchor_events.get(seq)
     if event is not None:
         event.set()
+    log.info("RAW upload seq=%d bytes=%d", seq, len(data))
     return {"ok": True, "seq": seq, "bytes": len(data)}
 
 
 # ---------- Helpers ----------
 
-async def _send(ws: WebSocket, msg: dict) -> None:
-    await ws.send_text(json.dumps(msg))
+async def _send(ws: WebSocket, msg: dict) -> bool:
+    """Send a JSON message; swallow dead-socket errors. Returns True on success."""
+    try:
+        await ws.send_text(json.dumps(msg))
+        return True
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        # RuntimeError "WebSocket is not connected" surfaces when the peer dropped
+        # before send. Not fatal — caller usually has nothing better to do.
+        log.info("WS send failed (%s): %s", type(exc).__name__, msg.get("type", "?"))
+        return False
+    except Exception:
+        log.exception("WS send unexpected error")
+        return False
 
 
 def _ensure_test_chart(path: Path) -> None:
@@ -255,7 +293,19 @@ async def _run_calibration_task() -> None:
         await _send(mobile.ws, msg)
 
     async def mobile_recv() -> dict:
-        return await mobile.queue.get()
+        # Race the queue read against mobile.closed so a disconnected mobile
+        # surfaces immediately instead of relying on 10s/180s/300s timeouts
+        # in iterate.py to fire one at a time.
+        get_task = asyncio.create_task(mobile.queue.get())
+        close_task = asyncio.create_task(mobile.closed.wait())
+        done, pending = await asyncio.wait(
+            {get_task, close_task}, return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        if get_task in done and not get_task.cancelled():
+            return get_task.result()
+        raise RuntimeError("Mobile disconnected during capture.")
 
     async def mobile_drain() -> None:
         """Discard any queued mobile messages (stale frames between patches)."""
@@ -315,4 +365,6 @@ async def _run_calibration_task() -> None:
             })
             await _send(mobile.ws, {"type": "all_done"})
         except Exception as exc:
+            log.exception("calibration task failed")
+            # _send already swallows dead-socket errors so this can't cascade.
             await _send(pc.ws, {"type": "error", "message": str(exc)})

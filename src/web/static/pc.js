@@ -162,9 +162,12 @@ const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
 const ws = new WebSocket(`${wsScheme}//${location.host}/ws/pc`);
 ws.onopen  = () => setConn('pulsing', 'connected');
 ws.onclose = () => setConn('', 'disconnected');
+ws.onerror = (e) => { console.warn('PC WS error', e); setConn('', 'connection error'); };
 
 ws.onmessage = ({ data }) => {
-  const msg = JSON.parse(data);
+  let msg;
+  try { msg = JSON.parse(data); }
+  catch (e) { console.warn('non-JSON WS frame ignored', e); return; }
 
   if (msg.type === 'error') {
     document.getElementById('error-text').textContent = msg.message;

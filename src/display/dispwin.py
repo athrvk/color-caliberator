@@ -8,11 +8,17 @@ def find_dispwin() -> str | None:
     return shutil.which("dispwin")
 
 
-def _run(args: list[str], retries: int = 3, delay: float = 0.5) -> None:
-    """Run dispwin, retrying on failure (Windows SetDeviceGammaRamp is occasionally flaky)."""
+def _run(args: list[str], retries: int = 3, delay: float = 0.5, timeout: float = 10.0) -> None:
+    """Run dispwin, retrying on transient failure with a per-call timeout."""
     last_err = ""
     for attempt in range(retries):
-        result = subprocess.run(args, capture_output=True, text=True)
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            last_err = f"timed out after {timeout}s ({exc})"
+            if attempt < retries - 1:
+                time.sleep(delay)
+            continue
         if result.returncode == 0:
             return
         last_err = result.stderr.strip() or result.stdout.strip() or "(no output)"

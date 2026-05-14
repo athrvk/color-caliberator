@@ -76,8 +76,15 @@ function connectWs() {
   const scheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${scheme}//${location.host}/ws/mobile`);
   ws.onopen    = () => { connDot.classList.add('live'); setStatus('Connected — waiting for PC…'); };
-  ws.onmessage = (evt) => handleMsg(JSON.parse(evt.data));
+  ws.onmessage = (evt) => {
+    let msg;
+    try { msg = JSON.parse(evt.data); }
+    catch (e) { console.warn('non-JSON WS frame ignored', e); return; }
+    try { handleMsg(msg); }
+    catch (e) { console.error('handleMsg crashed', e); }
+  };
   ws.onclose   = () => { connDot.classList.remove('live'); stopCapturing(); setStatus('Disconnected. Reload to reconnect.'); };
+  ws.onerror   = (e) => { console.warn('mobile WS error', e); };
 }
 
 document.addEventListener('visibilitychange', () => {
