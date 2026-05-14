@@ -34,6 +34,11 @@ def main():
         reload=False,
         ssl_keyfile=str(key_path),
         ssl_certfile=str(cert_path),
+        # Without this, uvicorn waits forever on Ctrl-C while our WebSocket
+        # handlers block on receive_text(). Cap at 3s — lifespan handler in
+        # web.server.py closes the sockets actively but the timeout protects
+        # us if a client refuses to close.
+        timeout_graceful_shutdown=3,
     )
 
 

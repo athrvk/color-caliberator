@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -27,7 +28,27 @@ from calibration.ramp import apply_lut_to_image
 
 STATIC_DIR = Path(__file__).parent / "static"
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    """Force-close held WebSockets and cancel the calibration task on uvicorn
+    shutdown. Without this, our ws_pc / ws_mobile coroutines block forever on
+    `endpoint.closed.wait()` because the reader is parked inside
+    `receive_text()` and uvicorn waits for them to exit gracefully."""
+    yield  # startup is a no-op
+    log.info("server shutdown — closing WebSockets and cancelling tasks")
+    if session.calibration_task and not session.calibration_task.done():
+        session.calibration_task.cancel()
+    for ep in (session.pc, session.mobile):
+        if ep is None:
+            continue
+        try:
+            await ep.ws.close(code=1001, reason="server shutting down")
+        except Exception:
+            pass
+        ep.closed.set()
+
+
+app = FastAPI(lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 
