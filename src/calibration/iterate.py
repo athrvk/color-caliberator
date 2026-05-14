@@ -27,6 +27,36 @@ SendFn = Callable[[dict], Awaitable[None]]
 RecvFn = Callable[[], Awaitable[dict]]
 DrainFn = Callable[[], Awaitable[None]]
 
+from calibration.raw import DngAnchor, parse_dng
+
+AnchorWaitFn = Callable[[int], Awaitable[bytes]]
+
+
+_ANCHOR_PROMPTS = [
+    (0, "WHITE", (255, 255, 255)),
+    (1, "RED",   (255, 0,   0)),
+    (2, "GREEN", (0,   255, 0)),
+    (3, "BLUE",  (0,   0,   255)),
+]
+
+
+async def _capture_anchors(
+    pc_send: SendFn,
+    mobile_send: SendFn,
+    wait_for_anchor: AnchorWaitFn,
+    tmp_dir: Path,
+) -> dict[int, DngAnchor]:
+    """Drive the 4-shot manual RAW anchor flow."""
+    parsed: dict[int, DngAnchor] = {}
+    for seq, label, rgb in _ANCHOR_PROMPTS:
+        await pc_send({"type": "show_patch", "rgb": list(rgb)})
+        await mobile_send({"type": "request_raw", "seq": seq, "label": label})
+        data = await wait_for_anchor(seq)
+        dng_path = tmp_dir / f"anchor_{seq}.dng"
+        await asyncio.to_thread(dng_path.write_bytes, data)
+        parsed[seq] = await asyncio.to_thread(parse_dng, dng_path)
+    return parsed
+
 SSNR_THRESHOLD = 20.0
 STABLE_FRAMES = 5
 CAPTURE_TIMEOUT = 10.0    # seconds per patch
@@ -166,11 +196,20 @@ async def run_calibration(
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
     tmp_dir: Path,
+    mode: str = "gamma",
+    wait_for_anchor: AnchorWaitFn | None = None,
 ) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run the full iterative calibration session.
     Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b).
     """
+    if mode == "color":
+        if wait_for_anchor is None:
+            raise RuntimeError("color mode requires wait_for_anchor callback")
+        anchors = await _capture_anchors(pc_send, mobile_send, wait_for_anchor, tmp_dir)
+    else:
+        anchors = None
+
     white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain)
 
     lut_r = identity_lut()
