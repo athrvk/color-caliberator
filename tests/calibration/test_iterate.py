@@ -60,10 +60,11 @@ async def test_run_calibration_converges_on_gamma_1_8_display(monkeypatch):
     fake = FakeProtocol(display_gamma=1.8)
 
     with tempfile.TemporaryDirectory() as tmp:
-        icc_bytes, delta_e = await run_calibration(
+        icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
             fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain, Path(tmp)
         )
 
     assert isinstance(icc_bytes, bytes) and len(icc_bytes) > 256
     assert icc_bytes[36:40] == b"acsp"
     assert np.isfinite(delta_e)
+    assert lut_r.shape == (256,) and lut_g.shape == (256,) and lut_b.shape == (256,)

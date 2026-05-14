@@ -166,7 +166,7 @@ async def run_calibration(
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
     tmp_dir: Path,
-) -> tuple[bytes, float]:
+) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run the full iterative calibration session.
     Returns (icc_bytes, final_delta_e).
@@ -245,4 +245,4 @@ async def run_calibration(
     vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
     icc_bytes = build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
 
-    return icc_bytes, final_delta_e
+    return icc_bytes, final_delta_e, lut_r, lut_g, lut_b

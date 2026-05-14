@@ -14,6 +14,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from display.dispwin import find_dispwin
 from util.qr import generate_qr_png
 
+import io
+import numpy as np
+from PIL import Image
+from calibration.ramp import apply_lut_to_image
+
 STATIC_DIR = Path(__file__).parent / "static"
 
 app = FastAPI()
@@ -165,6 +170,42 @@ async def _send(ws: WebSocket, msg: dict) -> None:
     await ws.send_text(json.dumps(msg))
 
 
+def _ensure_test_chart(path: Path) -> None:
+    if path.exists():
+        return
+    w, h = 640, 240
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    for x in range(w):
+        v = int(x / w * 255)
+        img[: h // 2, x] = [v, v, v]
+    colours = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (0, 255, 255), (255, 0, 255), (255, 165, 0), (128, 0, 128),
+    ]
+    strip_w = w // len(colours)
+    for i, c in enumerate(colours):
+        img[h // 2 :, i * strip_w : (i + 1) * strip_w] = c
+    Image.fromarray(img).save(path)
+
+
+def _build_comparison_b64(
+    chart_path: Path,
+    lut_r: np.ndarray,
+    lut_g: np.ndarray,
+    lut_b: np.ndarray,
+) -> tuple[str, str]:
+    """Return (before_b64, after_b64) as PNG base64 strings."""
+    img = np.array(Image.open(chart_path).convert("RGB"))
+    corrected = apply_lut_to_image(img, lut_r, lut_g, lut_b)
+
+    def to_b64(arr: np.ndarray) -> str:
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    return to_b64(img), to_b64(corrected)
+
+
 async def _run_calibration_task() -> None:
     """Wraps calibration loop; sends result or error to PC."""
     from calibration.iterate import run_calibration
@@ -192,11 +233,20 @@ async def _run_calibration_task() -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            icc_bytes, delta_e = await run_calibration(
+            icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
                 pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp)
             )
             icc_b64 = base64.b64encode(icc_bytes).decode()
-            await _send(pc.ws, {"type": "result", "icc_b64": icc_b64, "delta_e": delta_e})
+            chart_path = STATIC_DIR / "test_chart.png"
+            _ensure_test_chart(chart_path)
+            before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
+            await _send(pc.ws, {
+                "type": "result",
+                "icc_b64": icc_b64,
+                "delta_e": delta_e,
+                "before_b64": before_b64,
+                "after_b64": after_b64,
+            })
             await _send(mobile.ws, {"type": "all_done"})
         except Exception as exc:
             await _send(pc.ws, {"type": "error", "message": str(exc)})
