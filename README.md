@@ -60,12 +60,18 @@ Choose mode on the PC setup screen.
 ## Quick start (monkey mode)
 
 ```bash
+# 0. Install uv (if you don't have it)
+curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
+# Windows: https://docs.astral.sh/uv/getting-started/installation/
+
 # 1. Install ArgyllCMS so we can talk to your display
 brew install argyllcms          # macOS
 sudo apt install argyll         # Linux
 # Windows: https://www.argyllcms.com/downloadwin.html
 
-# 2. Run the server
+# 2. Clone, install deps, and run
+git clone https://github.com/athrvk/color-caliberator.git
+cd color-caliberator
 uv sync
 uv run python main.py
 ```
