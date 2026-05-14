@@ -36,6 +36,15 @@ def _desc_type(text: str) -> bytes:
     return body
 
 
+def _curv_table(curve: np.ndarray) -> bytes:
+    """ICC v2 'curv' type with 256-entry uint16 lookup table."""
+    table = np.clip(np.round(np.asarray(curve, dtype=float) * 65535.0), 0, 65535).astype(np.uint16)
+    return struct.pack(">4sII", b"curv", 0, table.shape[0]) + table.astype(">u2").tobytes()
+
+
+_D50_XYZ = np.array([0.9642, 1.0000, 0.8249])
+
+
 def _vcgt_type(r: np.ndarray, g: np.ndarray, b: np.ndarray) -> bytes:
     """Apple VideoCardGamma VCGT tag, table variant (type=0)."""
     header = struct.pack(">4sIIHHH", b"vcgt", 0, 0, 3, 256, 2)
@@ -116,5 +125,59 @@ def build_vcgt_profile(
 
     tag_data = b"".join(padded for _, _, _, padded in tag_layout)
 
+    header = _build_header(profile_size)
+    return header + tag_table + tag_data
+
+
+def build_matrix_shaper_profile(
+    r_trc: np.ndarray,
+    g_trc: np.ndarray,
+    b_trc: np.ndarray,
+    r_xyz_d50: np.ndarray,
+    g_xyz_d50: np.ndarray,
+    b_xyz_d50: np.ndarray,
+    r_vcgt_lut: np.ndarray | None = None,
+    g_vcgt_lut: np.ndarray | None = None,
+    b_vcgt_lut: np.ndarray | None = None,
+) -> bytes:
+    """Build an ICC v2 matrix-shaper profile.
+
+    r/g/b_trc: float [0, 1] tone response curves, length 256 (forward).
+    r/g/b_xyz_d50: display primaries in XYZ under D50 (PCS).
+    r/g/b_vcgt_lut: optional VCGT correction LUTs (uint16). If None, VCGT is identity.
+    """
+    if r_vcgt_lut is None:
+        identity = (np.linspace(0, 1, 256) * 65535).astype(np.uint16)
+        r_vcgt_lut = g_vcgt_lut = b_vcgt_lut = identity
+
+    tags_data: dict[bytes, bytes] = {
+        b"desc": _desc_type("Color Calibrator (matrix)"),
+        b"wtpt": _xyz_type(*_D50_XYZ),
+        b"rXYZ": _xyz_type(*r_xyz_d50),
+        b"gXYZ": _xyz_type(*g_xyz_d50),
+        b"bXYZ": _xyz_type(*b_xyz_d50),
+        b"rTRC": _curv_table(r_trc),
+        b"gTRC": _curv_table(g_trc),
+        b"bTRC": _curv_table(b_trc),
+        b"vcgt": _vcgt_type(r_vcgt_lut, g_vcgt_lut, b_vcgt_lut),
+    }
+
+    n = len(tags_data)
+    tag_data_start = 128 + 4 + n * 12
+    tag_layout: list[tuple[bytes, int, int, bytes]] = []
+    offset = tag_data_start
+    for sig, data in tags_data.items():
+        size = len(data)
+        pad = (-size) % 4
+        padded = data + b"\x00" * pad
+        tag_layout.append((sig, offset, size, padded))
+        offset += len(padded)
+
+    profile_size = offset
+    tag_table = struct.pack(">I", n)
+    for sig, off, size, _ in tag_layout:
+        tag_table += sig + struct.pack(">II", off, size)
+
+    tag_data = b"".join(p for _, _, _, p in tag_layout)
     header = _build_header(profile_size)
     return header + tag_table + tag_data
