@@ -63,10 +63,11 @@ async def test_run_calibration_converges_on_gamma_1_8_display(monkeypatch):
     fake = FakeProtocol(display_gamma=1.8)
 
     with tempfile.TemporaryDirectory() as tmp:
-        icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
+        icc_bytes, delta_e, lut_r, lut_g, lut_b, color_data = await run_calibration(
             fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain, Path(tmp)
         )
 
+    assert color_data is None
     assert isinstance(icc_bytes, bytes) and len(icc_bytes) > 256
     assert icc_bytes[36:40] == b"acsp"
     assert np.isfinite(delta_e)
@@ -89,7 +90,7 @@ async def test_run_calibration_calibrated_display_returns_near_identity(monkeypa
 
     fake = FakeProtocol(display_gamma=1.0)
     with tempfile.TemporaryDirectory() as tmp:
-        _icc, delta_e, lut_r, lut_g, lut_b = await run_calibration(
+        _icc, delta_e, lut_r, lut_g, lut_b, _color = await run_calibration(
             fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain, Path(tmp)
         )
 
@@ -143,10 +144,14 @@ async def test_run_calibration_color_mode_returns_matrix_profile(monkeypatch):
 
     fake = FakeProtocol(display_gamma=2.0, mode="color")
     with tempfile.TemporaryDirectory() as tmp:
-        icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
+        icc_bytes, delta_e, lut_r, lut_g, lut_b, color_data = await run_calibration(
             fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain,
             Path(tmp), mode="color", wait_for_anchor=fake.wait_for_anchor,
         )
+
+    assert color_data is not None
+    for k in ("r_xyz", "g_xyz", "b_xyz", "gamma_r", "gamma_g", "gamma_b"):
+        assert k in color_data
 
     assert isinstance(icc_bytes, bytes) and len(icc_bytes) > 1024
     assert icc_bytes[36:40] == b"acsp"

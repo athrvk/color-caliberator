@@ -39,7 +39,14 @@ def parse_dng(path: Path) -> DngAnchor:
         if isinstance(asn_raw, (tuple, list)) and len(asn_raw) == 3 and isinstance(asn_raw[0], tuple):
             asn = np.array([_to_float(v) for v in asn_raw], dtype=float)
         else:
-            asn = np.array(asn_raw, dtype=float).reshape(3)
+            asn_flat = np.array(asn_raw, dtype=float)
+            if asn_flat.size == 6:
+                # Flat (num, den) interleaved → fold into 3 rationals.
+                nums = asn_flat[0::2]
+                dens = asn_flat[1::2]
+                asn = np.where(dens == 0, 0.0, nums / np.where(dens == 0, 1.0, dens))
+            else:
+                asn = asn_flat.reshape(3)
         illum_2 = int(ifd[TAG_CALIBRATION_ILLUMINANT_2].value) if TAG_CALIBRATION_ILLUMINANT_2 in ifd else 21
 
     if forward_matrix_2 is None:
@@ -60,6 +67,13 @@ def parse_dng(path: Path) -> DngAnchor:
 def _read_3x3(tags, tag_id: int) -> np.ndarray:
     value = tags[tag_id].value
     arr = np.array([_to_float(v) for v in value], dtype=float)
+    # tifffile sometimes returns 9 (num, den) tuples → 9 floats.
+    # Other versions return 18 flat ints (num, den interleaved) → 18 floats.
+    # Fold pairs back into rationals when we got the flat form.
+    if arr.size == 18:
+        nums = arr[0::2]
+        dens = arr[1::2]
+        arr = np.where(dens == 0, 0.0, nums / np.where(dens == 0, 1.0, dens))
     return arr.reshape(3, 3)
 
 

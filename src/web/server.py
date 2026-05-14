@@ -121,6 +121,55 @@ async def mobile_page():
     return FileResponse(STATIC_DIR / "mobile.html")
 
 
+@app.get("/sessions")
+async def sessions_page():
+    return FileResponse(STATIC_DIR / "sessions.html")
+
+
+@app.get("/api/sessions")
+async def api_list_sessions():
+    from persistence.sessions import list_sessions
+    return {"sessions": list_sessions()}
+
+
+@app.get("/api/sessions/{session_id}")
+async def api_get_session(session_id: str):
+    from persistence.sessions import load_session
+    data = load_session(session_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {
+        "meta": data["meta"],
+        "summary": data["summary"],
+        "icc_b64": base64.b64encode(data["icc_bytes"]).decode(),
+        "before_b64": base64.b64encode(data["before_png"]).decode(),
+        "after_b64": base64.b64encode(data["after_png"]).decode(),
+    }
+
+
+@app.delete("/api/sessions/{session_id}")
+async def api_delete_session(session_id: str):
+    from persistence.sessions import delete_session
+    ok = delete_session(session_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="session not found")
+    return {"ok": True}
+
+
+@app.post("/api/sessions/{session_id}/rebuild")
+async def api_rebuild_session(session_id: str):
+    from persistence.rebuild import RebuildError, rebuild_session
+    chart_path = STATIC_DIR / "test_chart.png"
+    _ensure_test_chart(chart_path)
+    try:
+        result = await asyncio.to_thread(rebuild_session, session_id, base_dir=None, chart_path=chart_path)
+    except RebuildError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    return result
+
+
 # ---------- WebSocket: PC ----------
 
 @app.websocket("/ws/pc")
@@ -340,6 +389,36 @@ def _build_comparison_b64(
     return to_b64(img), to_b64(corrected)
 
 
+def _serialize_color_data(color_data: dict) -> dict:
+    """Make color_data JSON-friendly for the session summary."""
+    out: dict = {}
+    for k, v in color_data.items():
+        out[k] = v.tolist() if isinstance(v, np.ndarray) else v
+    return out
+
+
+def _build_cmm_comparison_b64(chart_path: Path, color_data: dict) -> tuple[str, str]:
+    """Return (before_b64, after_b64) where "after" is rendered through an
+    in-process software CMM. Used in color mode, where a 1D LUT preview
+    can't represent the matrix-shaper profile's primary correction.
+    """
+    from display.cmm import render_through_profile
+
+    img = np.array(Image.open(chart_path).convert("RGB"))
+    corrected = render_through_profile(
+        img,
+        color_data["r_xyz"], color_data["g_xyz"], color_data["b_xyz"],
+        color_data["gamma_r"], color_data["gamma_g"], color_data["gamma_b"],
+    )
+
+    def to_b64(arr: np.ndarray) -> str:
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode()
+
+    return to_b64(img), to_b64(corrected)
+
+
 async def _run_calibration_task() -> None:
     """Wraps calibration loop; sends result or error to PC."""
     from calibration.iterate import run_calibration
@@ -433,12 +512,21 @@ async def _run_calibration_task() -> None:
     import tempfile
     from pathlib import Path
 
+    from persistence.sessions import SessionRecorder
+    recorder = None
+    try:
+        recorder = SessionRecorder.create(mode=mode)
+    except Exception:
+        log.exception("could not create session recorder; continuing without persistence")
+        recorder = None
+
     with tempfile.TemporaryDirectory() as tmp:
         try:
-            icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
+            icc_bytes, delta_e, lut_r, lut_g, lut_b, color_data = await run_calibration(
                 pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp),
                 mode=mode,
                 wait_for_anchor=wait_for_anchor,
+                recorder=recorder,
             )
             # Stash for the live before/after toggle on the result screen.
             async with session.lock:
@@ -454,18 +542,44 @@ async def _run_calibration_task() -> None:
             icc_b64 = base64.b64encode(icc_bytes).decode()
             import math
             delta_e_payload = None if math.isnan(delta_e) else delta_e
-            chart_path = STATIC_DIR / "test_chart.png"
-            _ensure_test_chart(chart_path)
-            before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
-            await _send(pc.ws, {
+            payload: dict = {
                 "type": "result",
                 "mode": mode,
                 "icc_b64": icc_b64,
                 "delta_e": delta_e_payload,
-                "before_b64": before_b64,
-                "after_b64": after_b64,
-                "live_preview": True,
-            })
+            }
+            chart_path = STATIC_DIR / "test_chart.png"
+            _ensure_test_chart(chart_path)
+            if mode == "color" and color_data is not None:
+                # 1D VideoLUT can't represent primary-chromaticity correction,
+                # so we render the chart through an in-process CMM that
+                # mirrors what the OS would do once the ICC is installed.
+                before_b64, after_b64 = _build_cmm_comparison_b64(chart_path, color_data)
+                payload["before_b64"] = before_b64
+                payload["after_b64"] = after_b64
+                # No live VideoLUT preview in color mode — matrix-shaper
+                # correction lives in the CMM, not the VideoLUT.
+            else:
+                before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
+                payload["before_b64"] = before_b64
+                payload["after_b64"] = after_b64
+                payload["live_preview"] = True
+            await _send(pc.ws, payload)
+            if recorder is not None:
+                before_bytes = base64.b64decode(payload.get("before_b64", "")) if "before_b64" in payload else b""
+                after_bytes = base64.b64decode(payload.get("after_b64", "")) if "after_b64" in payload else b""
+                summary = {
+                    "mode": mode,
+                    "delta_e": delta_e_payload,
+                    "color_data": _serialize_color_data(color_data) if color_data else None,
+                }
+                try:
+                    await asyncio.to_thread(
+                        recorder.record_result, icc_bytes, before_bytes, after_bytes, summary,
+                    )
+                    await asyncio.to_thread(recorder.finalize, True, summary)
+                except Exception:
+                    log.exception("session recorder finalize failed")
             # Use the indirect resolver — mobile may have reconnected since
             # the task started so a snapshot would be stale.
             try:
@@ -475,6 +589,9 @@ async def _run_calibration_task() -> None:
                 log.info("could not notify mobile of all_done (likely disconnected)")
         except Exception as exc:
             log.exception("calibration task failed")
+            # Don't finalize() on error: leaving meta.json absent keeps the
+            # partial session out of /sessions listings (atomic completion).
+            # The raw frames stay on disk for forensic debugging.
             # Best-effort: reset the VideoLUT to identity so a partial bad
             # state from a half-finished round can't persist past failure.
             try:

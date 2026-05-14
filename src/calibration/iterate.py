@@ -2,13 +2,13 @@
 Iterative calibration loop.
 
 Receives send/recv callbacks for PC and mobile WebSocket connections.
-Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b) when done.
+Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b, color_data) when done.
 """
 
 import asyncio
 import time
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 import numpy as np
 
@@ -36,8 +36,10 @@ DrainFn = Callable[[], Awaitable[None]]
 from calibration.raw import DngAnchor, parse_dng
 from calibration.color_pipeline import (
     SRGB_PRIMARIES_XYZ_D50,
+    SRGB_TO_XYZ_D50,
     camera_rgb_to_xyz_d50,
-    fit_tone_response,
+    fit_channel_gamma,
+    forward_trc,
     project_onto_primary,
 )
 
@@ -54,13 +56,18 @@ async def _measure_color_patch(
     patch_index: int,
     round_num: int,
     white_frame: np.ndarray,
-    white_anchor: DngAnchor,
     pc_send: SendFn,
     mobile_send: SendFn,
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
+    recorder: Any | None = None,
 ) -> np.ndarray | None:
-    """Measure one single-channel patch and return measured XYZ_D50, or None."""
+    """Measure one single-channel patch and return measured XYZ_D50, or None.
+
+    The DNG anchors are used by the caller to derive primary XYZ directions
+    (camera-linear via ForwardMatrix2); per-patch measurement here works
+    entirely from the JPEG preview stream, which is sRGB-encoded.
+    """
     rgb = [0, 0, 0]
     rgb[channel_idx] = int(round(level * 255))
     await pc_send({"type": "show_patch", "rgb": rgb})
@@ -68,22 +75,47 @@ async def _measure_color_patch(
     await asyncio.sleep(SETTLE_DELAY)
     await mobile_drain()
     await mobile_send({"type": "capture", "n": patch_index + 1, "total": patch_total})
-    frame = await _wait_for_stable_frames(mobile_recv)
+    on_raw = None
+    if recorder is not None:
+        ch_name = "RGB"[channel_idx]
+        phase = f"color_{ch_name}"
+        def on_raw(jpeg: bytes, _phase=phase, _i=patch_index, _lv=level) -> None:
+            recorder.record_patch_raw_frame(_phase, round_num, _i, _lv, jpeg)
+    frame = await _wait_for_stable_frames(mobile_recv, on_raw=on_raw)
     await mobile_send({"type": "stop_capture"})
     await pc_send({"type": "patch_done", "n": patch_index + 1, "total": patch_total, "round": round_num})
     await mobile_send({"type": "patch_done", "n": patch_index + 1, "total": patch_total})
     if frame is None:
+        if recorder is not None:
+            ch_name = "RGB"[channel_idx]
+            recorder.record_patch_averaged(
+                f"color_{ch_name}", round_num, patch_index, level, None,
+                {"level": level, "channel": ch_name, "skipped": True},
+            )
         return None
 
     h, w = frame.shape[:2]
     patch_rgb = frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4].mean(axis=(0, 1)) / 255.0
     white_rgb = white_frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4].mean(axis=(0, 1)) / 255.0
 
+    # JPEG is sRGB-encoded (post-ISP). ForwardMatrix2 from the DNG expects
+    # *camera-linear* input (raw sensor space), so applying it to sRGB-linear
+    # data double-counts the camera's color matrix. Instead, use the standard
+    # sRGB→XYZ_D50 matrix here. The DNG-derived display primaries used in
+    # `_run_color_rounds` stay correct (camera-linear DNG sample × FM2 →
+    # XYZ_D50), so projection lands in a consistent XYZ_D50 space.
     patch_linear = _srgb_to_linear(patch_rgb)
     white_linear = np.clip(_srgb_to_linear(white_rgb), 1e-6, None)
-    relative_rgb = patch_linear / white_linear
+    relative_srgb_linear = patch_linear / white_linear
 
-    return camera_rgb_to_xyz_d50(relative_rgb, white_anchor.as_shot_neutral, white_anchor.forward_matrix_2)
+    xyz = SRGB_TO_XYZ_D50 @ relative_srgb_linear
+    if recorder is not None:
+        ch_name = "RGB"[channel_idx]
+        recorder.record_patch_averaged(
+            f"color_{ch_name}", round_num, patch_index, level, frame,
+            {"level": level, "channel": ch_name, "xyz_d50": xyz},
+        )
+    return xyz
 
 
 async def _run_color_rounds(
@@ -93,9 +125,9 @@ async def _run_color_rounds(
     mobile_send: SendFn,
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    recorder: Any | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], tuple[float, float, float]]:
     """Run color-mode patch loop. Returns (r_trc, g_trc, b_trc, primary_xyz_d50)."""
-    white_anchor = anchors[0]
     levels = np.array([p.level for p in GRAY_PATCHES])
 
     primary_xyz: dict[str, np.ndarray] = {}
@@ -115,8 +147,9 @@ async def _run_color_rounds(
         for level in levels:
             measured_xyz = await _measure_color_patch(
                 float(level), ch_idx, total, patch_index, 1,
-                white_frame, white_anchor,
+                white_frame,
                 pc_send, mobile_send, mobile_recv, mobile_drain,
+                recorder=recorder,
             )
             patch_index += 1
             if measured_xyz is None:
@@ -131,11 +164,18 @@ async def _run_color_rounds(
         ref = max(projections[-1], 1e-6)
         return projections / ref
 
-    r_trc = fit_tone_response(levels, _rescale_to_unit("R"))
-    g_trc = fit_tone_response(levels, _rescale_to_unit("G"))
-    b_trc = fit_tone_response(levels, _rescale_to_unit("B"))
+    gamma_r = fit_channel_gamma(levels, _rescale_to_unit("R"))
+    gamma_g = fit_channel_gamma(levels, _rescale_to_unit("G"))
+    gamma_b = fit_channel_gamma(levels, _rescale_to_unit("B"))
 
-    return r_trc, g_trc, b_trc, primary_xyz
+    # The matrix-shaper ICC stores the *forward* (measured) display TRC so
+    # the CMM can invert it during rendering. Returning the pre-warp here
+    # would silently produce a profile that double-applies the curve.
+    r_trc = forward_trc(gamma_r)
+    g_trc = forward_trc(gamma_g)
+    b_trc = forward_trc(gamma_b)
+
+    return r_trc, g_trc, b_trc, primary_xyz, (gamma_r, gamma_g, gamma_b)
 
 
 _ANCHOR_PROMPTS = [
@@ -151,6 +191,7 @@ async def _capture_anchors(
     mobile_send: SendFn,
     wait_for_anchor: AnchorWaitFn,
     tmp_dir: Path,
+    recorder: Any | None = None,
 ) -> dict[int, DngAnchor]:
     """Drive the 4-shot manual RAW anchor flow."""
     parsed: dict[int, DngAnchor] = {}
@@ -160,6 +201,8 @@ async def _capture_anchors(
         data = await wait_for_anchor(seq)
         dng_path = tmp_dir / f"anchor_{seq}.dng"
         await asyncio.to_thread(dng_path.write_bytes, data)
+        if recorder is not None:
+            await asyncio.to_thread(recorder.record_anchor, seq, label, data)
         parsed[seq] = await asyncio.to_thread(parse_dng, dng_path)
     return parsed
 
@@ -173,8 +216,18 @@ MAX_ROUNDS = 3
 CONVERGENCE_DELTA_E = 1.0
 
 
-async def _wait_for_stable_frames(mobile_recv: RecvFn) -> np.ndarray | None:
-    """Collect frames until SSNR stable or timeout. Returns averaged frame or None."""
+async def _wait_for_stable_frames(
+    mobile_recv: RecvFn,
+    on_raw: Callable[[bytes], None] | None = None,
+) -> np.ndarray | None:
+    """Collect frames until SSNR stable or timeout. Returns averaged frame or None.
+
+    `on_raw`: optional callback invoked with each captured JPEG payload bytes.
+    Used by the session recorder to archive every raw frame without coupling
+    the capture loop to persistence.
+    """
+    import base64 as _b64
+
     luminances: list[float] = []
     frames: list[np.ndarray] = []
     deadline = time.monotonic() + CAPTURE_TIMEOUT
@@ -183,7 +236,13 @@ async def _wait_for_stable_frames(mobile_recv: RecvFn) -> np.ndarray | None:
         msg = await asyncio.wait_for(mobile_recv(), timeout=max(0.1, deadline - time.monotonic()))
         if msg.get("type") != "frame":
             continue
-        frame = decode_frame(msg["data"])
+        raw_b64 = msg["data"]
+        frame = decode_frame(raw_b64)
+        if on_raw is not None:
+            try:
+                on_raw(_b64.b64decode(raw_b64))
+            except Exception:
+                pass
         luma = frame_luminance(frame)
         luminances.append(luma)
         frames.append(frame)
@@ -226,6 +285,7 @@ async def _capture_white_reference(
     mobile_send: SendFn,
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
+    recorder: Any | None = None,
 ) -> np.ndarray:
     """Show white patch, wait for WB lock from mobile, capture 5 stable frames."""
     level = 255
@@ -246,14 +306,17 @@ async def _capture_white_reference(
     await asyncio.sleep(SETTLE_DELAY)
     await mobile_drain()
     await mobile_send({"type": "capture", "n": 0, "total": 0, "phase": "white_ref"})
+    on_raw = recorder.record_white_raw_frame if recorder is not None else None
     try:
-        frame = await _wait_for_stable_frames(mobile_recv)
+        frame = await _wait_for_stable_frames(mobile_recv, on_raw=on_raw)
     finally:
         await mobile_send({"type": "stop_capture"})
     if frame is None:
         raise RuntimeError(
             "White reference capture timed out. Check room lighting and phone position."
         )
+    if recorder is not None:
+        recorder.record_white_averaged(frame)
     return frame
 
 
@@ -267,6 +330,8 @@ async def _measure_patch(
     mobile_send: SendFn,
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
+    recorder: Any | None = None,
+    phase: str = "round",
 ) -> float | None:
     """Show one gray patch, capture, return normalized luminance or None if skipped."""
     v = int(round(patch_level * 255))
@@ -283,7 +348,11 @@ async def _measure_patch(
         "total": patch_total,
     })
 
-    frame = await _wait_for_stable_frames(mobile_recv)
+    on_raw = None
+    if recorder is not None:
+        def on_raw(jpeg: bytes, _phase=phase, _round=round_num, _i=patch_index, _lv=patch_level) -> None:
+            recorder.record_patch_raw_frame(_phase, _round, _i, _lv, jpeg)
+    frame = await _wait_for_stable_frames(mobile_recv, on_raw=on_raw)
 
     await mobile_send({"type": "stop_capture"})
     await pc_send({
@@ -299,8 +368,15 @@ async def _measure_patch(
     })
 
     if frame is None:
+        if recorder is not None:
+            recorder.record_patch_averaged(phase, round_num, patch_index, patch_level, None,
+                                           {"level": patch_level, "skipped": True})
         return None
-    return _normalize_luma(frame, white_frame)
+    luma = _normalize_luma(frame, white_frame)
+    if recorder is not None:
+        recorder.record_patch_averaged(phase, round_num, patch_index, patch_level, frame,
+                                       {"level": patch_level, "luma_normalized": luma})
+    return luma
 
 
 async def run_calibration(
@@ -311,32 +387,54 @@ async def run_calibration(
     tmp_dir: Path,
     mode: str = "gamma",
     wait_for_anchor: AnchorWaitFn | None = None,
-) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
+    recorder: Any | None = None,
+) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray, dict | None]:
     """
     Run the full iterative calibration session.
-    Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b).
+
+    Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b, color_data).
+    `color_data` is None in gamma mode; in color mode it carries the data the
+    server needs to render an honest "after" preview through a software CMM:
+    `{r_xyz, g_xyz, b_xyz, gamma_r, gamma_g, gamma_b}`.
     """
     if mode == "color":
         if wait_for_anchor is None:
             raise RuntimeError("color mode requires wait_for_anchor callback")
-        anchors = await _capture_anchors(pc_send, mobile_send, wait_for_anchor, tmp_dir)
+        anchors = await _capture_anchors(pc_send, mobile_send, wait_for_anchor, tmp_dir, recorder=recorder)
     else:
         anchors = None
 
-    white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain)
+    white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain, recorder=recorder)
 
     if mode == "color":
-        r_trc, g_trc, b_trc, primary_xyz = await _run_color_rounds(
+        r_trc, g_trc, b_trc, primary_xyz, gammas = await _run_color_rounds(
             white_frame, anchors, pc_send, mobile_send, mobile_recv, mobile_drain,
+            recorder=recorder,
         )
         from display.profile import build_matrix_shaper_profile
         icc_bytes = build_matrix_shaper_profile(
             r_trc, g_trc, b_trc,
             primary_xyz["R"], primary_xyz["G"], primary_xyz["B"],
         )
-        await pc_send({"type": "round_done", "round": 1})
+        await pc_send({
+            "type": "round_done", "round": 1,
+            "gamma_r": gammas[0], "gamma_g": gammas[1], "gamma_b": gammas[2],
+        })
         await mobile_send({"type": "round_done"})
-        return icc_bytes, float("nan"), r_trc, g_trc, b_trc
+        # Identity LUTs returned in color mode: the matrix-shaper ICC is the
+        # deliverable; per-channel VideoLUT correction can't express primary
+        # chromaticity adjustments anyway. Caller skips the live VideoLUT
+        # preview and instead renders the chart through display.cmm.
+        identity = identity_lut()
+        color_data = {
+            "r_xyz": primary_xyz["R"],
+            "g_xyz": primary_xyz["G"],
+            "b_xyz": primary_xyz["B"],
+            "gamma_r": float(gammas[0]),
+            "gamma_g": float(gammas[1]),
+            "gamma_b": float(gammas[2]),
+        }
+        return icc_bytes, float("nan"), identity, identity.copy(), identity.copy(), color_data
 
     # Native VideoLUT manipulation via display.videolut backend:
     #   macOS  → CGSetDisplayTransferByTable (CoreGraphics, transient, no admin)
@@ -367,6 +465,7 @@ async def run_calibration(
             luma = await _measure_patch(
                 patch.level, i, total, round_num,
                 white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
+                recorder=recorder, phase="round",
             )
             if luma is None:
                 skipped += 1
@@ -403,6 +502,7 @@ async def run_calibration(
         luma = await _measure_patch(
             patch.level, i, len(HOLDOUT_PATCHES), 0,
             white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
+            recorder=recorder, phase="holdout",
         )
         holdout_measured.append(luma if luma is not None else patch.target_luma)
 
@@ -418,4 +518,4 @@ async def run_calibration(
     # installs persistently; applying it is their explicit action.
     await asyncio.to_thread(clear_ramp)
 
-    return icc_bytes, final_delta_e, lut_r, lut_g, lut_b
+    return icc_bytes, final_delta_e, lut_r, lut_g, lut_b, None

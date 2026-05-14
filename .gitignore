@@ -1,6 +1,7 @@
 # Worktrees and runtime artifacts
 .worktrees/
 .cert/
+.sessions/
 src/web/static/test_chart.png
 tests/fixtures/*.dng
 

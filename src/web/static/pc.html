@@ -437,6 +437,7 @@ body::before {
       <span class="app-name" style="pointer-events: stroke;"><em>Chroma</em> &nbsp;/&nbsp; Display Calibration</span>
     </button>
     <div class="conn-row">
+      <a href="/sessions" style="font-family:var(--mono); font-size:0.74rem; color:var(--text-mid); text-decoration:none; border:1px solid var(--border); padding:0.35rem 0.75rem; border-radius:6px; margin-right:0.75rem;">Sessions</a>
       <span class="conn-dot" id="conn-dot"></span>
       <span id="conn-label">connecting</span>
     </div>
@@ -622,8 +623,8 @@ body::before {
       </div>
     </div>
     <div class="result-right">
-      <div class="section-label">Before / After</div>
-      <div class="comparison-wrap">
+      <div class="section-label" id="comparison-label">Before / After</div>
+      <div class="comparison-wrap" id="comparison-wrap">
         <div class="cmp-half">
           <img id="before-img" alt="Before">
           <div class="cmp-label">Before</div>

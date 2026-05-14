@@ -51,6 +51,8 @@ function setPips(state) {
   });
 }
 
+let lastColorGammas = null;
+
 // ── ΔE counter animation ──
 function countUp(target, ms = 1300) {
   const el = document.getElementById('de-number');
@@ -125,9 +127,19 @@ function showResult(msg) {
   const failBanner = document.getElementById('fail-banner');
 
   if (msg.mode === 'color') {
-    document.getElementById('de-number').textContent = '—';
+    const numEl = document.getElementById('de-number');
+    const unitEl = document.querySelector('.de-unit');
+    if (lastColorGammas) {
+      const { r, g, b } = lastColorGammas;
+      const avg = (r + g + b) / 3;
+      numEl.textContent = avg.toFixed(2);
+      if (unitEl) unitEl.textContent = 'Display γ (R/G/B avg)';
+      noteEl.textContent = `Per-channel γ — R ${r.toFixed(2)}, G ${g.toFixed(2)}, B ${b.toFixed(2)}. sRGB target ≈ 2.20. Profile encodes these and the primary chromaticities for OS-level color matching.`;
+    } else {
+      numEl.textContent = '—';
+      noteEl.textContent = 'Matrix-shaper profile with white point and primary chromaticities.';
+    }
     gradeEl.textContent = 'Color Profile'; gradeEl.className = 'de-grade grade-a';
-    noteEl.textContent = 'Matrix-shaper profile with white point and primary chromaticities.';
     failBanner.hidden = true;
   } else {
     const de = msg.delta_e ?? 0;
@@ -152,8 +164,22 @@ function showResult(msg) {
     }
   }
 
-  if (msg.before_b64) document.getElementById('before-img').src = `data:image/png;base64,${msg.before_b64}`;
-  if (msg.after_b64)  document.getElementById('after-img').src  = `data:image/png;base64,${msg.after_b64}`;
+  const cmpWrap = document.getElementById('comparison-wrap');
+  const cmpLabel = document.getElementById('comparison-label');
+  if (msg.before_b64 && msg.after_b64) {
+    document.getElementById('before-img').src = `data:image/png;base64,${msg.before_b64}`;
+    document.getElementById('after-img').src  = `data:image/png;base64,${msg.after_b64}`;
+    if (cmpWrap) cmpWrap.style.display = '';
+    if (cmpLabel) {
+      cmpLabel.style.display = '';
+      cmpLabel.textContent = msg.mode === 'color'
+        ? 'Before / After (simulated via software CMM)'
+        : 'Before / After';
+    }
+  } else {
+    if (cmpWrap) cmpWrap.style.display = 'none';
+    if (cmpLabel) cmpLabel.style.display = 'none';
+  }
 
   const bytes = Uint8Array.from(atob(msg.icc_b64), c => c.charCodeAt(0));
   const url   = URL.createObjectURL(new Blob([bytes], { type: 'application/vnd.iccprofile' }));
@@ -276,6 +302,9 @@ ws.onmessage = ({ data }) => {
 
   if (msg.type === 'round_done') {
     document.getElementById('apply-round').textContent = msg.round;
+    if (typeof msg.gamma_r === 'number') {
+      lastColorGammas = { r: msg.gamma_r, g: msg.gamma_g, b: msg.gamma_b };
+    }
     resetTiles();
     show('applying'); return;
   }

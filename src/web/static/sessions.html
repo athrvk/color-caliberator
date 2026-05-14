@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chroma — Sessions</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link
+  href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,500;0,600;1,300&display=swap"
+  rel="stylesheet">
+<style>
+  :root {
+    --bg: #06090e;
+    --bg-card: #0c1018;
+    --bg-hover: #111820;
+    --border: #1a2332;
+    --border-hi: #263040;
+    --text: #d4e4f4;
+    --text-mid: #7a8ea4;
+    --text-dim: #3a4a5c;
+    --accent: #2de2c4;
+    --accent-glow: rgba(45, 226, 196, 0.18);
+    --error: #ff4455;
+    --mono: 'IBM Plex Mono', monospace;
+    --sans: 'IBM Plex Sans', sans-serif;
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    width: 100%; min-height: 100%;
+    background: var(--bg); color: var(--text);
+    font-family: var(--sans); font-size: 15px; line-height: 1.6;
+  }
+  body { padding: 2.5rem 3rem 4rem; }
+
+  .spectrum-bar {
+    position: fixed; top: 0; left: 0; right: 0; height: 2px; z-index: 999;
+    background: linear-gradient(to right,
+      #ff2244 0%, #ff6600 16%, #ffe000 33%,
+      #44ee66 50%, #00aaff 66%, #8844ff 83%, #ff2244 100%);
+    opacity: 0.4;
+  }
+
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 2rem; }
+  .brand { font-family: var(--mono); font-weight: 600; letter-spacing: 0.16em; color: var(--accent); }
+  .brand .sep { color: var(--text-dim); margin: 0 0.6rem; }
+  .brand .crumb { color: var(--text-mid); }
+  a.home { font-family: var(--mono); font-size: 0.78rem; color: var(--text-mid); text-decoration: none; border: 1px solid var(--border); padding: 0.4rem 0.8rem; border-radius: 6px; }
+  a.home:hover { background: var(--bg-hover); color: var(--text); }
+
+  .layout { display: grid; grid-template-columns: 360px 1fr; gap: 1.5rem; }
+
+  .list { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; max-height: calc(100vh - 8rem); overflow-y: auto; }
+  .list-empty { padding: 2rem 1.25rem; color: var(--text-dim); font-family: var(--mono); font-size: 0.78rem; text-align: center; }
+
+  .item { display: block; width: 100%; text-align: left; background: transparent; color: inherit; border: 0; border-bottom: 1px solid var(--border); padding: 0.85rem 1rem; font: inherit; cursor: pointer; transition: background 0.15s; }
+  .item:hover { background: var(--bg-hover); }
+  .item.selected { background: var(--bg-hover); border-left: 2px solid var(--accent); padding-left: calc(1rem - 2px); }
+  .item-id { font-family: var(--mono); font-size: 0.74rem; color: var(--text-mid); margin-bottom: 0.2rem; }
+  .item-row { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; }
+  .badge { font-family: var(--mono); font-size: 0.66rem; padding: 0.12rem 0.5rem; border-radius: 999px; text-transform: uppercase; letter-spacing: 0.08em; }
+  .badge.gamma { color: var(--accent); border: 1px solid var(--accent-glow); }
+  .badge.color { color: #8844ff; border: 1px solid rgba(136, 68, 255, 0.35); }
+  .item-meta { font-family: var(--mono); font-size: 0.7rem; color: var(--text-dim); margin-top: 0.25rem; }
+
+  .detail { background: var(--bg-card); border: 1px solid var(--border); border-radius: 10px; padding: 1.5rem; min-height: 320px; }
+  .detail-empty { color: var(--text-dim); font-family: var(--mono); font-size: 0.84rem; text-align: center; padding: 4rem 1rem; }
+  .detail h2 { font-family: var(--mono); font-size: 0.85rem; color: var(--text-mid); font-weight: 500; letter-spacing: 0.12em; text-transform: uppercase; margin-bottom: 0.6rem; }
+  .detail .meta-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0.5rem 1.5rem; margin-bottom: 1.5rem; font-family: var(--mono); font-size: 0.82rem; }
+  .detail .k { color: var(--text-dim); }
+  .detail .v { color: var(--text); }
+
+  .actions { display: flex; gap: 0.6rem; margin-bottom: 1.5rem; }
+  .btn { font-family: var(--mono); font-size: 0.78rem; padding: 0.55rem 1rem; border-radius: 6px; cursor: pointer; border: 1px solid var(--accent); background: var(--accent); color: #06090e; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .btn:hover { filter: brightness(1.08); }
+  .btn.ghost { background: transparent; color: var(--accent); }
+  .btn.danger { border-color: var(--error); color: var(--error); background: transparent; }
+  .btn.danger:hover { background: rgba(255,68,85,0.08); }
+
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; align-items: stretch; }
+  .cmp-half { position: relative; border-radius: 8px; overflow: hidden; background: #000; aspect-ratio: 4 / 1; }
+  .cmp-half img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .cmp-label { position: absolute; bottom: 0.4rem; left: 0.6rem; font-family: var(--mono); font-size: 0.7rem; color: rgba(255,255,255,0.55); letter-spacing: 0.08em; text-transform: uppercase; }
+
+  footer { margin-top: 1.5rem; font-family: var(--mono); font-size: 0.7rem; color: var(--text-dim); }
+</style>
+</head>
+<body>
+  <div class="spectrum-bar"></div>
+  <header>
+    <div class="brand">CHROMA <span class="sep">/</span> <span class="crumb">SESSIONS</span></div>
+    <a class="home" href="/">← Back to calibrate</a>
+  </header>
+
+  <div class="layout">
+    <div class="list" id="list">
+      <div class="list-empty">Loading…</div>
+    </div>
+    <div class="detail" id="detail">
+      <div class="detail-empty">Select a session to view the result.</div>
+    </div>
+  </div>
+
+  <script src="/static/sessions.js"></script>
+</body>
+</html>
