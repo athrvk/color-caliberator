@@ -333,6 +333,16 @@ async def run_calibration(
         await mobile_send({"type": "round_done"})
         return icc_bytes, float("nan"), r_trc, g_trc, b_trc
 
+    import sys as _sys
+
+    # On Windows, SetDeviceGammaRamp (used by dispwin) is reset by the OS and
+    # other drivers between rounds, making mid-loop VideoLUT writes unreliable.
+    # Instead we pre-warp the patch display level through the current correction
+    # LUT so the display sees the compensated input — mathematically equivalent
+    # convergence without touching the VideoLUT during measurement.
+    # On Mac/Linux dispwin VideoLUT access is stable so we use it as intended.
+    _windows_mode = _sys.platform == "win32"
+
     lut_r = identity_lut()
     lut_g = identity_lut()
     lut_b = identity_lut()
@@ -341,13 +351,19 @@ async def run_calibration(
     best_luts = (lut_r.copy(), lut_g.copy(), lut_b.copy())
 
     for round_num in range(1, MAX_ROUNDS + 1):
-        tmp_icc = tmp_dir / f"round_{round_num}.icc"
-        vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
-        await asyncio.to_thread(
-            tmp_icc.write_bytes, build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
-        )
-        await asyncio.to_thread(clear_ramp)
-        await asyncio.to_thread(apply_ramp, str(tmp_icc))
+        if _windows_mode:
+            # Windows: keep VideoLUT at identity; compensate by warping patch levels.
+            # Round 1 LUT is identity so patch levels are unchanged — same as Mac/Linux.
+            pass
+        else:
+            # Mac/Linux: apply accumulated correction to the display VideoLUT before measuring.
+            tmp_icc = tmp_dir / f"round_{round_num}.icc"
+            vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
+            await asyncio.to_thread(
+                tmp_icc.write_bytes, build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
+            )
+            await asyncio.to_thread(clear_ramp)
+            await asyncio.to_thread(apply_ramp, str(tmp_icc))
 
         measured_lumas: list[float] = []
         target_lumas: list[float] = []
@@ -355,9 +371,19 @@ async def run_calibration(
         patches = GRAY_PATCHES
         total = len(patches)
 
+        x256 = np.linspace(0.0, 1.0, 256)  # LUT index positions
+
         for i, patch in enumerate(patches):
+            if _windows_mode and round_num > 1:
+                # Pre-warp: look up what level the current LUT maps patch.level to,
+                # then show that warped level so the display's uncorrected gamma
+                # combined with the warped input produces the target output.
+                display_level = float(np.interp(patch.level, x256, lut_r))
+            else:
+                display_level = patch.level
+
             luma = await _measure_patch(
-                patch.level, i, total, round_num,
+                display_level, i, total, round_num,
                 white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
             )
             if luma is None:
