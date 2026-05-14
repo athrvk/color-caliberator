@@ -108,6 +108,7 @@ async def ws_pc(websocket: WebSocket):
     if not backend_available():
         await _send(websocket, {
             "type": "error",
+            "kind": "backend_unavailable",
             "message": f"no VideoLUT backend available: {backend_error()}",
         })
         await websocket.close()
@@ -142,7 +143,7 @@ async def _pc_control_loop(pc: "Endpoint") -> None:
             async with session.lock:
                 mobile = session.mobile
                 if mobile is None:
-                    await _send(pc.ws, {"type": "error", "message": "Mobile not connected."})
+                    await _send(pc.ws, {"type": "error", "kind": "mobile_disconnected", "message": "Mobile not connected."})
                     continue
                 if session.calibration_task and not session.calibration_task.done():
                     continue  # already running
@@ -159,12 +160,14 @@ async def _pc_control_loop(pc: "Endpoint") -> None:
                 try:
                     await asyncio.to_thread(apply_ramp_arrays, *luts)
                 except Exception as exc:
-                    await _send(pc.ws, {"type": "error", "message": f"preview failed: {exc}"})
-        elif t == "preview_original":
+                    await _send(pc.ws, {"type": "error", "kind": "runtime", "message": f"preview failed: {exc}"})
+        elif t == "preview_original" or t == "reset_display":
             try:
                 await asyncio.to_thread(clear_ramp)
+                if t == "reset_display":
+                    await _send(pc.ws, {"type": "display_reset", "ok": True})
             except Exception as exc:
-                await _send(pc.ws, {"type": "error", "message": f"preview failed: {exc}"})
+                await _send(pc.ws, {"type": "error", "kind": "runtime", "message": f"reset failed: {exc}"})
 
 
 # ---------- WebSocket: Mobile ----------
@@ -191,7 +194,21 @@ async def ws_mobile(websocket: WebSocket):
             if session.mobile is endpoint:
                 session.mobile = None
         if pc is not None and not pc.closed.is_set():
-            await _send(pc.ws, {"type": "error", "message": "Mobile disconnected."})
+            await _send(pc.ws, {"type": "error", "kind": "mobile_disconnected", "message": "Mobile disconnected."})
+
+
+@app.post("/reset_display")
+async def reset_display():
+    """Panic button: force the VideoLUT back to identity. Exposed as an HTTP
+    endpoint (not just a WS message) so the user can curl it from a
+    second machine on the LAN if their PC's display is so broken they
+    can't see the calibrator UI."""
+    try:
+        await asyncio.to_thread(clear_ramp)
+    except Exception as exc:
+        log.exception("reset_display failed")
+        raise HTTPException(status_code=500, detail=str(exc))
+    return {"ok": True}
 
 
 @app.post("/upload/raw/{seq}")
@@ -368,5 +385,11 @@ async def _run_calibration_task() -> None:
             await _send(mobile.ws, {"type": "all_done"})
         except Exception as exc:
             log.exception("calibration task failed")
+            # Best-effort: reset the VideoLUT to identity so a partial bad
+            # state from a half-finished round can't persist past failure.
+            try:
+                await asyncio.to_thread(clear_ramp)
+            except Exception:
+                log.exception("clear_ramp on failure also failed")
             # _send already swallows dead-socket errors so this can't cascade.
-            await _send(pc.ws, {"type": "error", "message": str(exc)})
+            await _send(pc.ws, {"type": "error", "kind": "calibration_failed", "message": str(exc)})

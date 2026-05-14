@@ -96,6 +96,26 @@ document.getElementById('install-toggle').onclick = function () {
   box.style.display = box.style.display === 'block' ? 'none' : 'block';
 };
 
+// ── Emergency reset (error screen + result-failure banner) ──
+function requestDisplayReset(btn) {
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Resetting…';
+  const restore = (msg) => { btn.textContent = msg; setTimeout(() => { btn.disabled = false; btn.textContent = originalText; }, 2000); };
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'reset_display' }));
+    btn.dataset.restoreText = originalText;
+  } else {
+    // WS dead — fall back to HTTPS endpoint (works from any PC on LAN).
+    fetch('/reset_display', { method: 'POST' })
+      .then(r => restore(r.ok ? 'Reset OK' : 'Reset failed'))
+      .catch(() => restore('Reset failed'));
+  }
+}
+
+document.getElementById('reset-display-btn').onclick = function () { requestDisplayReset(this); };
+document.getElementById('fail-reset-btn').onclick = function () { requestDisplayReset(this); };
+
 // ── Result screen ──
 function showResult(msg) {
   document.body.style.background = '';
@@ -177,6 +197,18 @@ ws.onmessage = ({ data }) => {
 
   if (msg.type === 'error') {
     document.getElementById('error-text').textContent = msg.message;
+    const eyebrow = document.getElementById('error-eyebrow');
+    const hints = {
+      backend_unavailable: { eyebrow: 'Setup Required',       hint: 'error-hint-backend' },
+      mobile_disconnected: { eyebrow: 'Mobile Disconnected',  hint: 'error-hint-mobile'  },
+      calibration_failed:  { eyebrow: 'Calibration Failed',   hint: 'error-hint-runtime' },
+      runtime:             { eyebrow: 'Error',                hint: 'error-hint-runtime' },
+    };
+    const cfg = hints[msg.kind] || hints.runtime;
+    eyebrow.textContent = cfg.eyebrow;
+    ['error-hint-backend', 'error-hint-mobile', 'error-hint-runtime'].forEach(id => {
+      document.getElementById(id).hidden = (id !== cfg.hint);
+    });
     show('error'); return;
   }
 
@@ -250,5 +282,12 @@ ws.onmessage = ({ data }) => {
 
   if (msg.type === 'result') {
     showResult(msg); return;
+  }
+
+  if (msg.type === 'display_reset') {
+    const btn = document.getElementById('reset-display-btn');
+    btn.textContent = msg.ok ? 'Reset OK' : 'Reset failed';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Reset Display Gamma'; }, 2000);
+    return;
   }
 };

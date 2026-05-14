@@ -443,9 +443,11 @@ body::before {
   <!-- ERROR -->
   <div id="s-error" class="screen">
     <div class="error-card">
-      <div class="error-eyebrow">Setup Required</div>
+      <div class="error-eyebrow" id="error-eyebrow">Error</div>
       <div class="error-body" id="error-text"></div>
-      <div class="error-hint">
+
+      <!-- backend_unavailable: setup hint -->
+      <div class="error-hint" id="error-hint-backend" hidden>
         macOS and Windows use native VideoLUT APIs — no extra install needed.
         Linux needs <strong>ArgyllCMS</strong> (provides <code>dispwin</code>):
         <div class="error-code">
@@ -454,6 +456,31 @@ body::before {
           <span>Docs → <a href="https://www.argyllcms.com/" target="_blank" rel="noopener noreferrer">argyllcms.com</a></span>
         </div>
       </div>
+
+      <!-- mobile_disconnected: reconnect hint -->
+      <div class="error-hint" id="error-hint-mobile" hidden>
+        Reload the mobile page on your phone and re-scan the QR. The PC will
+        pick up the new connection automatically.
+      </div>
+
+      <!-- calibration_failed / runtime: retry hint -->
+      <div class="error-hint" id="error-hint-runtime" hidden>
+        The calibration loop hit an error. Common causes:<br>
+        <span style="color:var(--text-mid)">
+          - Mobile camera lost focus or exposure drifted mid-capture<br>
+          - Room not dark enough — try again with less ambient light<br>
+          - Display VideoLUT rejected by GPU driver (see message above)<br>
+        </span><br>
+        Reload this page to retry. The button below resets the display to
+        its uncorrected state in case a partial calibration left it looking
+        wrong.
+      </div>
+
+      <button class="btn" id="reset-display-btn" style="margin-top:1rem;">Reset Display Gamma</button>
+      <p style="font-size:0.72rem; color:var(--text-mid); margin-top:0.5rem; line-height:1.6;">
+        Forces the VideoLUT to identity. Equivalent to <code>dispwin -c</code> /
+        <code>dccw</code> / lock-and-unlock Windows.
+      </p>
     </div>
   </div>
 
@@ -561,6 +588,7 @@ body::before {
           centre and perfectly still, and camera exposure is not locked to a
           bright value. Then restart and try again.
         </span>
+        <button class="btn" id="fail-reset-btn" style="margin-top:0.8rem; padding:0.5rem 1rem; font-size:0.7rem;">Reset Display Gamma</button>
       </div>
       <button class="btn solid" id="download-btn" style="width:100%; margin-bottom:0.5rem">Download .icc
         Profile</button>

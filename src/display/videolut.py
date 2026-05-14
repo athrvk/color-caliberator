@@ -127,29 +127,76 @@ def _windows_backend() -> tuple[Callable, Callable, str]:
                 ramp[offset + i] = int(scaled[i])
         return ramp
 
+    def _identity_ramp() -> "ctypes.Array":
+        ramp = (ctypes.c_uint16 * (256 * 3))()
+        for c in range(3):
+            for i in range(256):
+                ramp[c * 256 + i] = (i * 65535) // 255
+        return ramp
+
+    def _force_identity(hdc) -> bool:
+        """Attempt to reset the LUT to identity. Used as last-resort cleanup
+        so a failed apply() doesn't leave the display stuck on a bad LUT."""
+        ident = _identity_ramp()
+        for _ in range(3):
+            if SetDeviceGammaRamp(hdc, ident):
+                return True
+        return False
+
+    def _is_monotonic(arr: np.ndarray) -> bool:
+        """Windows rejects non-monotonic LUTs and ones with >32768 jumps."""
+        a = np.asarray(arr)
+        if len(a) < 2:
+            return True
+        diffs = np.diff(a)
+        return bool(np.all(diffs >= -1e-9) or np.all(diffs <= 1e-9))
+
     def apply(r: np.ndarray, g: np.ndarray, b: np.ndarray, display_index: int = 0) -> None:
         if display_index != 0:
             raise RuntimeError("Windows backend only supports the primary display (index 0)")
+        for name, lut in (("r", r), ("g", g), ("b", b)):
+            if not _is_monotonic(lut):
+                raise RuntimeError(f"{name} LUT is not monotonic — Windows will reject it")
         hdc = GetDC(None)
         if not hdc:
             raise RuntimeError("GetDC failed for primary display")
         try:
             ramp = _floats_to_ramp(r, g, b)
             # Retry: SetDeviceGammaRamp is intermittently wiped by competing
-            # software (nVidia Optimus, vendor color tools). Verify by reading
-            # the ramp back and re-applying if mismatched.
+            # software (nVidia Optimus, vendor color tools).
             import time
             for attempt in range(3):
                 if SetDeviceGammaRamp(hdc, ramp):
                     return
                 time.sleep(0.3)
-            raise RuntimeError("SetDeviceGammaRamp failed after 3 attempts")
+            # Failure recovery: force identity ramp so the display doesn't
+            # stay stuck on whatever partial state earlier successful calls
+            # in the round may have left behind.
+            recovered = _force_identity(hdc)
+            raise RuntimeError(
+                "SetDeviceGammaRamp failed after 3 attempts."
+                + (" Display LUT reset to identity." if recovered else
+                   " Display LUT may still be in a bad state — reboot or run dccw.")
+                + " On Windows 10/11 this commonly means the registry value"
+                  " HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ICM\\"
+                  "GdiICMGammaRange is too low. Set it to 256 (DWORD) and reboot."
+                  " Also disable HDR mode and any vendor color tool"
+                  " (nVidia / Intel / f.lux / DisplayCAL Profile Loader).",
+            )
         finally:
             ReleaseDC(None, hdc)
 
     def clear(display_index: int = 0) -> None:
-        identity = np.linspace(0.0, 1.0, 256)
-        apply(identity, identity, identity, display_index)
+        if display_index != 0:
+            raise RuntimeError("Windows backend only supports the primary display (index 0)")
+        hdc = GetDC(None)
+        if not hdc:
+            raise RuntimeError("GetDC failed for primary display")
+        try:
+            if not _force_identity(hdc):
+                raise RuntimeError("SetDeviceGammaRamp(identity) failed — reboot or run dccw.")
+        finally:
+            ReleaseDC(None, hdc)
 
     return apply, clear, "windows"
 
