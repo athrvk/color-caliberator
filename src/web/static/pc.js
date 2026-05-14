@@ -140,6 +140,20 @@ function showResult(msg) {
   dlBtn.onclick = () => {
     Object.assign(document.createElement('a'), { href: url, download: 'color-calibrator.icc' }).click();
   };
+
+  // Whole-desktop live preview toggle (TruHu-style). Server holds the final
+  // LUTs in memory and flips the VideoLUT on click.
+  const liveBox = document.getElementById('live-preview');
+  if (msg.live_preview && liveBox) {
+    liveBox.hidden = false;
+    document.getElementById('preview-corrected-btn').onclick = () => {
+      ws.send(JSON.stringify({ type: 'preview_corrected' }));
+    };
+    document.getElementById('preview-original-btn').onclick = () => {
+      ws.send(JSON.stringify({ type: 'preview_original' }));
+    };
+  }
+
   show('result');
 }
 

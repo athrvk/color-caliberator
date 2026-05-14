@@ -577,6 +577,17 @@ body::before {
           <div class="cmp-label">After</div>
         </div>
       </div>
+      <div id="live-preview" hidden style="margin-top:1.25rem;">
+        <div class="section-label">Live preview (whole screen)</div>
+        <p style="font-size:0.78rem; color:var(--text-mid); margin-bottom:0.6rem;">
+          Toggles the VideoLUT for your entire desktop, not just this page.
+          Same trick TruHu / DisplayCAL use to demo a calibration.
+        </p>
+        <div style="display:flex; gap:0.5rem;">
+          <button class="btn" id="preview-original-btn" style="flex:1;">Show Original</button>
+          <button class="btn solid" id="preview-corrected-btn" style="flex:1;">Show Corrected</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>

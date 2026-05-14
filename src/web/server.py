@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from display.dispwin import find_dispwin
+from display.videolut import apply_ramp_arrays, backend_available, backend_error, clear_ramp
 from util.qr import generate_qr_png
 from util.tls import detect_lan_ip
 
@@ -48,6 +48,10 @@ class Session:
             0: asyncio.Event(), 1: asyncio.Event(),
             2: asyncio.Event(), 3: asyncio.Event(),
         }
+        # Final corrected LUTs after calibration completes. Lets the PC result
+        # screen flip the live VideoLUT between corrected/original for a
+        # whole-desktop before/after preview (TruHu-style).
+        self.final_luts: tuple = ()
 
 
 session = Session()
@@ -90,11 +94,10 @@ async def ws_pc(websocket: WebSocket):
     async with session.lock:
         session.pc = endpoint
 
-    dispwin_path = find_dispwin()
-    if dispwin_path is None:
+    if not backend_available():
         await _send(websocket, {
             "type": "error",
-            "message": "dispwin not found — install ArgyllCMS and add it to PATH.",
+            "message": f"no VideoLUT backend available: {backend_error()}",
         })
         await websocket.close()
         session.pc = None
@@ -120,10 +123,11 @@ async def ws_pc(websocket: WebSocket):
 
 
 async def _pc_control_loop(pc: "Endpoint") -> None:
-    """Consume PC-originated messages. Currently: start_calibration trigger."""
+    """Consume PC-originated messages: start_calibration + preview toggles."""
     while not pc.closed.is_set():
         msg = await pc.queue.get()
-        if msg.get("type") == "start_calibration":
+        t = msg.get("type")
+        if t == "start_calibration":
             async with session.lock:
                 mobile = session.mobile
                 if mobile is None:
@@ -136,6 +140,19 @@ async def _pc_control_loop(pc: "Endpoint") -> None:
                 for ev in session.anchor_events.values():
                     ev.clear()
                 session.calibration_task = asyncio.create_task(_run_calibration_task())
+        elif t == "preview_corrected":
+            # Reload the calibrated VideoLUT for whole-desktop before/after toggle.
+            luts = session.final_luts
+            if luts:
+                try:
+                    await asyncio.to_thread(apply_ramp_arrays, *luts)
+                except Exception as exc:
+                    await _send(pc.ws, {"type": "error", "message": f"preview failed: {exc}"})
+        elif t == "preview_original":
+            try:
+                await asyncio.to_thread(clear_ramp)
+            except Exception as exc:
+                await _send(pc.ws, {"type": "error", "message": f"preview failed: {exc}"})
 
 
 # ---------- WebSocket: Mobile ----------
@@ -272,6 +289,15 @@ async def _run_calibration_task() -> None:
                 mode=mode,
                 wait_for_anchor=wait_for_anchor,
             )
+            # Stash for the live before/after toggle on the result screen.
+            async with session.lock:
+                session.final_luts = (lut_r, lut_g, lut_b)
+            # Apply the corrected LUT so the result page already shows the
+            # post-calibration look. User can flip to "Original" to compare.
+            try:
+                await asyncio.to_thread(apply_ramp_arrays, lut_r, lut_g, lut_b)
+            except Exception:
+                pass  # toggle still works even if initial apply fails
             icc_b64 = base64.b64encode(icc_bytes).decode()
             import math
             delta_e_payload = None if math.isnan(delta_e) else delta_e
@@ -285,6 +311,7 @@ async def _run_calibration_task() -> None:
                 "delta_e": delta_e_payload,
                 "before_b64": before_b64,
                 "after_b64": after_b64,
+                "live_preview": True,
             })
             await _send(mobile.ws, {"type": "all_done"})
         except Exception as exc:
