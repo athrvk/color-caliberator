@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>Color Calibrator — Mobile</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #000; color: #fff; font-family: system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+#viewfinder { width: 100vw; height: 100vh; object-fit: cover; position: fixed; top: 0; left: 0; z-index: 0; }
+#overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; padding: 2rem; gap: 1rem; pointer-events: none; }
+#status { background: rgba(0,0,0,0.7); padding: 0.6rem 1.2rem; border-radius: 20px; font-size: 1rem; }
+#ssnr-bar-wrap { width: 80%; height: 10px; background: rgba(255,255,255,0.2); border-radius: 5px; overflow: hidden; }
+#ssnr-bar { height: 100%; width: 0%; background: #4caf50; transition: width 0.2s, background 0.2s; }
+#ready-btn, #start-cam-btn { pointer-events: auto; padding: 1rem 3rem; background: #4caf50; color: #fff; border: none; border-radius: 30px; font-size: 1.2rem; cursor: pointer; }
+#ready-btn { display: none; }
+#flash { position: fixed; inset: 0; background: #4caf50; opacity: 0; z-index: 10; pointer-events: none; transition: opacity 0.1s; }
+canvas { display: none; }
+</style>
+</head>
+<body>
+<video id="viewfinder" autoplay playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="overlay">
+  <div id="status">Tap Start Camera to begin.</div>
+  <div id="ssnr-bar-wrap"><div id="ssnr-bar"></div></div>
+  <button id="start-cam-btn">Start Camera</button>
+  <button id="ready-btn">Ready</button>
+</div>
+<div id="flash"></div>
+
+<script>
+const video       = document.getElementById('viewfinder');
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const status      = document.getElementById('status');
+const ssnrBar     = document.getElementById('ssnr-bar');
+const readyBtn    = document.getElementById('ready-btn');
+const startCamBtn = document.getElementById('start-cam-btn');
+const flash       = document.getElementById('flash');
+
+let ws;
+let capturing = false;
+let captureInterval = null;
+
+// iOS Safari requires getUserMedia to be called from a user gesture handler.
+// Page-load invocation is blocked. Wire to an explicit Start Camera button.
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    status.textContent = 'Camera API unavailable. Use HTTPS and a modern browser.';
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
+    });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width  = video.videoWidth  || 1280;
+    canvas.height = video.videoHeight || 720;
+    startCamBtn.style.display = 'none';
+    status.textContent = 'Camera ready. Aim at the PC screen.';
+    connectWs();
+  } catch (e) {
+    status.textContent = 'Camera access denied: ' + (e.message || e.name);
+  }
+}
+
+startCamBtn.onclick = startCamera;
+
+function connectWs() {
+  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsScheme}//${location.host}/ws/mobile`);
+
+  ws.onopen = () => { status.textContent = 'Connected. Waiting for instructions…'; };
+
+  ws.onmessage = (evt) => {
+    const msg = JSON.parse(evt.data);
+
+    if (msg.type === 'show_white_for_wb') {
+      status.textContent = 'Lock exposure and white balance on this white screen, then tap Ready.';
+      readyBtn.style.display = 'block';
+      readyBtn.onclick = () => {
+        ws.send(JSON.stringify({ type: 'ready' }));
+        readyBtn.style.display = 'none';
+        status.textContent = 'White balance locked. Waiting…';
+      };
+      return;
+    }
+
+    if (msg.type === 'capture') {
+      capturing = true;
+      status.textContent = `Capturing patch ${msg.n} of ${msg.total}…`;
+      ssnrBar.style.background = '#f5a623';
+      ssnrBar.style.width = '30%';
+      startCapturing();
+      return;
+    }
+
+    if (msg.type === 'stop_capture') {
+      stopCapturing();
+      return;
+    }
+
+    if (msg.type === 'patch_done') {
+      stopCapturing();
+      ssnrBar.style.background = '#4caf50';
+      ssnrBar.style.width = '100%';
+      status.textContent = `Patch ${msg.n} of ${msg.total} captured ✓`;
+      // Green flash
+      flash.style.opacity = '0.6';
+      setTimeout(() => { flash.style.opacity = '0'; }, 200);
+      return;
+    }
+
+    if (msg.type === 'round_done') {
+      ssnrBar.style.width = '0%';
+      status.textContent = 'Round complete — applying correction, please wait…';
+      return;
+    }
+
+    if (msg.type === 'all_done') {
+      status.textContent = 'All done — check your PC for the result!';
+      ssnrBar.style.width = '100%';
+      return;
+    }
+  };
+
+  ws.onclose = () => {
+    stopCapturing();
+    status.textContent = 'Disconnected. Reload to reconnect.';
+  };
+}
+
+function startCapturing() {
+  if (captureInterval) return;
+  captureInterval = setInterval(sendFrame, 200); // 5 fps
+}
+
+function stopCapturing() {
+  capturing = false;
+  if (captureInterval) { clearInterval(captureInterval); captureInterval = null; }
+}
+
+function sendFrame() {
+  if (!capturing || ws.readyState !== WebSocket.OPEN) return;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+  ws.send(JSON.stringify({ type: 'frame', data: dataUrl.split(',')[1] }));
+}
+</script>
+</body>
+</html>

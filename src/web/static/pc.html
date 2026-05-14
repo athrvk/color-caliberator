@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Color Calibrator — PC</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- Screen 1: Error (dispwin missing) -->
+<div id="s-error" class="screen">
+  <h1>Setup Required</h1>
+  <p class="error-msg" id="error-text"></p>
+  <p>Install <strong>ArgyllCMS</strong> and add <code>dispwin</code> to your PATH:</p>
+  <pre>
+Windows: https://www.argyllcms.com/downloadwin.html
+Mac:     brew install argyllcms
+Linux:   sudo apt install argyll  (or dnf/pacman equivalent)
+  </pre>
+</div>
+
+<!-- Screen 2: QR code -->
+<div id="s-qr" class="screen active">
+  <h1>Scan with your phone</h1>
+  <img id="qr-img" class="qr-img" alt="QR code loading…">
+  <p>Open <code id="mobile-url"></code> in your mobile browser, or scan the QR code above.</p>
+  <p>Waiting for mobile to connect…</p>
+</div>
+
+<!-- Screen 3: Setup instructions -->
+<div id="s-setup" class="screen">
+  <h1>Setup</h1>
+  <p>1. Darken the room as much as possible.</p>
+  <p>2. Hold your phone 30 cm from the centre of the screen, perpendicular to it.</p>
+  <p>3. On your phone: tap <strong>Start Camera</strong>, then aim it at the screen.</p>
+  <p>4. When ready, click Begin below. The screen will show a white patch — lock your phone's <strong>exposure and white balance</strong>, then tap Ready on your phone.</p>
+  <button id="begin-btn">Begin Calibration</button>
+</div>
+
+<!-- Screen 4: Measuring -->
+<div id="s-measuring" class="screen">
+  <h1>Measuring — Round <span id="round-num">1</span> of 3</h1>
+  <p>Patch <span id="patch-num">0</span> of <span id="patch-total">11</span></p>
+  <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width:0%"></div></div>
+  <div class="ssnr-indicator ssnr-waiting" id="ssnr-badge">Waiting for stable frame…</div>
+</div>
+
+<!-- Screen 5: Applying correction -->
+<div id="s-applying" class="screen">
+  <h1>Applying Correction…</h1>
+  <p>Round <span id="apply-round">1</span> complete. Applying gamma ramp to display.</p>
+</div>
+
+<!-- Screen 6: Result -->
+<div id="s-result" class="screen">
+  <h1>Calibration Complete</h1>
+  <p class="delta-e">ΔE: <span id="delta-e-value">—</span></p>
+  <p>Lower is better. Hardware colorimeters achieve &lt;1 ΔE.</p>
+  <div class="before-after">
+    <div><p>Before</p><img id="before-img" alt="Before" src=""></div>
+    <div><p>After</p><img id="after-img" alt="After" src=""></div>
+  </div>
+  <button id="download-btn">Download .icc Profile</button>
+  <details>
+    <summary>How to install</summary>
+    <pre id="install-instructions"></pre>
+  </details>
+</div>
+
+<script>
+const screens = {
+  error:     document.getElementById('s-error'),
+  qr:        document.getElementById('s-qr'),
+  setup:     document.getElementById('s-setup'),
+  measuring: document.getElementById('s-measuring'),
+  applying:  document.getElementById('s-applying'),
+  result:    document.getElementById('s-result'),
+};
+
+function showScreen(name) {
+  Object.values(screens).forEach(s => s.classList.remove('active'));
+  screens[name].classList.add('active');
+}
+
+const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(`${wsScheme}//${location.host}/ws/pc`);
+
+ws.onmessage = (evt) => {
+  const msg = JSON.parse(evt.data);
+
+  if (msg.type === 'error') {
+    document.getElementById('error-text').textContent = msg.message;
+    showScreen('error');
+    return;
+  }
+
+  if (msg.type === 'qr_code') {
+    document.getElementById('qr-img').src = `data:image/png;base64,${msg.png_b64}`;
+    document.getElementById('mobile-url').textContent = msg.url;
+    showScreen('qr');
+    return;
+  }
+
+  if (msg.type === 'mobile_connected') {
+    showScreen('setup');
+    document.getElementById('begin-btn').onclick = () => {
+      ws.send(JSON.stringify({ type: 'start_calibration' }));
+      document.getElementById('begin-btn').disabled = true;
+      document.getElementById('begin-btn').textContent = 'Starting…';
+    };
+    return;
+  }
+
+  if (msg.type === 'show_patch') {
+    const [r, g, b] = msg.rgb;
+    document.body.style.background = `rgb(${r},${g},${b})`;
+    // Hide all wizard chrome so the camera measures a clean full-screen patch.
+    Object.values(screens).forEach(s => s.classList.remove('active'));
+    return;
+  }
+
+  if (msg.type === 'patch_done') {
+    document.body.style.background = '#111';
+    document.getElementById('patch-num').textContent = msg.n;
+    document.getElementById('patch-total').textContent = msg.total;
+    const pct = (msg.n / msg.total * 100).toFixed(0);
+    document.getElementById('progress-fill').style.width = pct + '%';
+    if (msg.round && msg.round > 0) {
+      document.getElementById('round-num').textContent = msg.round;
+    }
+    const badge = document.getElementById('ssnr-badge');
+    badge.textContent = 'Captured ✓';
+    badge.className = 'ssnr-indicator ssnr-stable';
+    showScreen('measuring');
+    return;
+  }
+
+  if (msg.type === 'holdout_started') {
+    document.querySelector('#s-measuring h1').textContent = 'Verifying Calibration';
+    document.getElementById('patch-total').textContent = msg.total;
+    document.getElementById('progress-fill').style.width = '0%';
+    showScreen('measuring');
+    return;
+  }
+
+  if (msg.type === 'capturing') {
+    // Keep wizard chrome hidden during capture so the patch fills the screen.
+    document.getElementById('round-num').textContent = msg.round;
+    const badge = document.getElementById('ssnr-badge');
+    badge.textContent = 'Waiting for stable frame…';
+    badge.className = 'ssnr-indicator ssnr-waiting';
+    return;
+  }
+
+  if (msg.type === 'round_done') {
+    document.getElementById('apply-round').textContent = msg.round;
+    showScreen('applying');
+    return;
+  }
+
+  if (msg.type === 'result') {
+    document.body.style.background = '#111';
+    document.body.style.color = '#eee';
+    document.getElementById('delta-e-value').textContent = msg.delta_e.toFixed(2);
+    if (msg.before_b64) document.getElementById('before-img').src = `data:image/png;base64,${msg.before_b64}`;
+    if (msg.after_b64)  document.getElementById('after-img').src  = `data:image/png;base64,${msg.after_b64}`;
+
+    const iccBytes = Uint8Array.from(atob(msg.icc_b64), c => c.charCodeAt(0));
+    const blob = new Blob([iccBytes], { type: 'application/vnd.iccprofile' });
+    const url  = URL.createObjectURL(blob);
+    const btn  = document.getElementById('download-btn');
+    btn.onclick = () => { const a = document.createElement('a'); a.href = url; a.download = 'color-calibrator.icc'; a.click(); };
+
+    document.getElementById('install-instructions').textContent = `Windows:
+  1. Double-click color-calibrator.icc → Install Profile
+  2. Win+R → colorcpl → Devices tab → select display
+  3. Tick "Use my settings for this device" → Set as default
+
+Mac:
+  Double-click .icc → ColorSync Utility installs and activates automatically.
+
+Linux (X11):
+  xcalib color-calibrator.icc
+  or copy to ~/.local/share/icc/ and activate via display settings.
+
+Linux (Wayland):
+  Copy to ~/.local/share/icc/, then: colormgr device-set-property ... Colorspace <profile-id>`;
+
+    showScreen('result');
+  }
+};
+</script>
+</body>
+</html>

@@ -1,1 +1,3 @@
 .worktrees/
+.cert/
+src/web/static/test_chart.png
