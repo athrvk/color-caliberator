@@ -6,11 +6,46 @@ from PIL import Image
 
 
 def frame_luminance(frame: np.ndarray) -> float:
-    """BT.601 luma of the center 50% crop of an H×W×3 uint8 array."""
+    """BT.601 luma of the center 50% crop of an H×W×3 uint8 array.
+
+    Operates in sRGB-encoded space — fine for stability/SSNR checks where only
+    variance matters. For calibration math (gamma fit, luminance ratios), use
+    `frame_luminance_linear` instead so the math stays in physical light.
+    """
     h, w = frame.shape[:2]
     crop = frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4]
     r, g, b = crop[:, :, 0], crop[:, :, 1], crop[:, :, 2]
     return float(0.299 * r.mean() + 0.587 * g.mean() + 0.114 * b.mean())
+
+
+def srgb_to_linear(rgb_0_1: np.ndarray) -> np.ndarray:
+    """Reverse the sRGB encoding curve.
+
+    Assumes the phone encodes JPEGs in sRGB. iPhones since iOS 11 may use
+    Display P3 by default; users should set their camera to Most Compatible
+    (sRGB) for accurate results.
+    """
+    a = 0.055
+    return np.where(
+        rgb_0_1 <= 0.04045,
+        rgb_0_1 / 12.92,
+        ((rgb_0_1 + a) / (1 + a)) ** 2.4,
+    )
+
+
+def frame_luminance_linear(frame: np.ndarray) -> float:
+    """BT.709 relative luminance of the center 50% crop after sRGB→linear.
+
+    Use this for any math that compares against physical luminance targets
+    (e.g. patch_luma / white_luma vs. level**2.2).
+    """
+    h, w = frame.shape[:2]
+    crop = frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4].astype(np.float64) / 255.0
+    lin = srgb_to_linear(crop)
+    r = lin[:, :, 0].mean()
+    g = lin[:, :, 1].mean()
+    b = lin[:, :, 2].mean()
+    return float(0.2126 * r + 0.7152 * g + 0.0722 * b)
 
 
 def ssnr_db(luminances: list[float]) -> float:

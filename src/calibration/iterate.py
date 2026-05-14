@@ -12,7 +12,13 @@ from typing import Awaitable, Callable
 
 import numpy as np
 
-from calibration.capture import decode_frame, frame_luminance, is_stable
+from calibration.capture import (
+    decode_frame,
+    frame_luminance,
+    frame_luminance_linear,
+    is_stable,
+    srgb_to_linear,
+)
 from calibration.patches import GRAY_PATCHES, HOLDOUT_PATCHES
 from calibration.ramp import (
     compose_luts,
@@ -38,15 +44,7 @@ from calibration.color_pipeline import (
 AnchorWaitFn = Callable[[int], Awaitable[bytes]]
 
 
-def _srgb_to_linear(rgb_0_1: np.ndarray) -> np.ndarray:
-    """Reverse the sRGB encoding curve.
-
-    Assumes the phone encodes JPEGs in sRGB. iPhones since iOS 11 may use
-    Display P3 by default; users should set their camera to Most Compatible
-    (sRGB) for accurate color-mode results. See Task 12 README note.
-    """
-    a = 0.055
-    return np.where(rgb_0_1 <= 0.04045, rgb_0_1 / 12.92, ((rgb_0_1 + a) / (1 + a)) ** 2.4)
+_srgb_to_linear = srgb_to_linear
 
 
 async def _measure_color_patch(
@@ -202,9 +200,16 @@ async def _wait_for_stable_frames(mobile_recv: RecvFn) -> np.ndarray | None:
 
 
 def _normalize_luma(frame: np.ndarray, white_frame: np.ndarray) -> float:
-    """Relative luminance: measured luma / white-reference luma. Clamped to [0, 1]."""
-    white_luma = frame_luminance(white_frame)
-    patch_luma = frame_luminance(frame)
+    """Relative luminance: measured / white-reference, in linear-light space.
+
+    Linearizes both frames via sRGB→linear before BT.709 luminance so the
+    ratio matches the linear `target_luma = level ** 2.2` model. Skipping
+    the linearization makes the fit see measured ≈ level (because camera
+    re-encodes the display's x^2.2 output back to sRGB), yielding γ_d ≈ 1
+    and a bogus x^2.2 correction that crushes blacks.
+    """
+    white_luma = frame_luminance_linear(white_frame)
+    patch_luma = frame_luminance_linear(frame)
     if white_luma < 1e-6:
         return 0.0
     return float(np.clip(patch_luma / white_luma, 0.0, 1.0))

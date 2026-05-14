@@ -73,6 +73,35 @@ async def test_run_calibration_converges_on_gamma_1_8_display(monkeypatch):
     assert lut_r.shape == (256,) and lut_g.shape == (256,) and lut_b.shape == (256,)
 
 
+@pytest.mark.asyncio
+async def test_run_calibration_calibrated_display_returns_near_identity(monkeypatch):
+    """Regression: a perfectly calibrated sRGB display should yield a near-
+    identity correction LUT, not the x^2.2 crush that resulted from comparing
+    sRGB-encoded camera lumas against linear targets.
+
+    In the realistic chain the camera JPEG pixel ≈ display input (because the
+    camera re-encodes the display's x^2.2 emission back through sRGB^-1).
+    FakeProtocol with display_gamma=1.0 models exactly that.
+    """
+    monkeypatch.setattr(iterate, "clear_ramp", lambda *a, **k: None)
+    monkeypatch.setattr(iterate, "apply_ramp_arrays", lambda *a, **k: None)
+    monkeypatch.setattr(iterate, "SETTLE_DELAY", 0.0)
+
+    fake = FakeProtocol(display_gamma=1.0)
+    with tempfile.TemporaryDirectory() as tmp:
+        _icc, delta_e, lut_r, lut_g, lut_b = await run_calibration(
+            fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain, Path(tmp)
+        )
+
+    identity = np.linspace(0.0, 1.0, 256)
+    # Midtones must not be crushed (the bug pushed lut[128] ≈ 0.5**2.2 ≈ 0.218).
+    assert lut_r[128] > 0.40
+    assert lut_g[128] > 0.40
+    assert lut_b[128] > 0.40
+    np.testing.assert_allclose(lut_r, identity, atol=0.08)
+    assert delta_e < 5.0
+
+
 from calibration.raw import DngAnchor
 
 
