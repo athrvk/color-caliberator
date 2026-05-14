@@ -24,6 +24,9 @@ let capturing = false;
 let captureInterval = null;
 let totalPatches = 0;
 let donePatches  = 0;
+let videoTrack  = null;
+let lockSupported = false;  // true if camera exposes manual WB/exposure/focus
+let isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || /CriOS/.test(navigator.userAgent);
 
 // ── SSNR arc (r=80, circumference ≈ 502) ──
 const CIRC = 2 * Math.PI * 80;
@@ -49,7 +52,7 @@ function setStatus(txt) {
 // ── Camera ──
 async function startCamera() {
   if (!navigator.mediaDevices?.getUserMedia) {
-    setStatus('Camera API unavailable. Use HTTPS + Chrome/Safari.');
+    setStatus('Camera API unavailable. Use HTTPS + Chrome.');
     return;
   }
   try {
@@ -60,12 +63,45 @@ async function startCamera() {
     await video.play();
     canvas.width  = video.videoWidth  || 1280;
     canvas.height = video.videoHeight || 720;
+    videoTrack = stream.getVideoTracks()[0];
+
+    // Detect manual lock capability. Chrome Android exposes whiteBalanceMode,
+    // exposureMode, focusMode in track capabilities. iOS Chrome (WebKit
+    // engine) does NOT — Apple gates this off; users must fall back to
+    // native-camera tap-and-hold AE/AF lock workflow.
+    const caps = (typeof videoTrack.getCapabilities === 'function')
+      ? videoTrack.getCapabilities()
+      : {};
+    lockSupported =
+      Array.isArray(caps.whiteBalanceMode) && caps.whiteBalanceMode.includes('manual') &&
+      Array.isArray(caps.exposureMode)     && caps.exposureMode.includes('manual') &&
+      Array.isArray(caps.focusMode)        && caps.focusMode.includes('manual');
+    console.log('camera capabilities:', caps, 'lockSupported:', lockSupported);
+
     video.classList.add('visible');
     splash.classList.add('gone');
     setStatus('Camera live. Connecting to PC…');
     connectWs();
   } catch (e) {
     setStatus('Camera denied: ' + (e.message || e.name));
+  }
+}
+
+async function lockCamera() {
+  /* Pin WB/exposure/focus at their current values. Chrome Android only. */
+  if (!videoTrack || !lockSupported) return false;
+  try {
+    await videoTrack.applyConstraints({
+      advanced: [{
+        whiteBalanceMode: 'manual',
+        exposureMode:     'manual',
+        focusMode:        'manual',
+      }],
+    });
+    return true;
+  } catch (e) {
+    console.warn('applyConstraints lock failed', e);
+    return false;
   }
 }
 
@@ -100,12 +136,23 @@ function handleMsg(msg) {
   if (msg.type === 'show_white_for_wb') {
     reticle.classList.add('visible');
     ssnrWrap.classList.add('visible');
-    setStatus('Lock exposure + white balance on the white screen, then tap Ready.');
+    if (lockSupported) {
+      setStatus('Aim at the white screen. Tap Ready to auto-lock WB + exposure + focus.');
+    } else if (isIOS) {
+      setStatus('iOS Chrome can\'t auto-lock the camera. Open the native Camera app, tap-and-hold the white area until AE/AF LOCK appears, return here, then tap Ready.');
+    } else {
+      setStatus('Manual lock unavailable on this device. Hold the phone perfectly still on the white area and tap Ready.');
+    }
     readyBtn.hidden = false;
-    readyBtn.onclick = () => {
+    readyBtn.onclick = async () => {
+      readyBtn.disabled = true;
+      const locked = await lockCamera();
       ws.send(JSON.stringify({ type: 'ready' }));
       readyBtn.hidden = true;
-      setStatus('White balance locked. Waiting for first patch…');
+      readyBtn.disabled = false;
+      setStatus(locked
+        ? 'Camera locked. Waiting for first patch…'
+        : 'Ready sent. Keep the phone steady — auto-lock unavailable on this device.');
     };
     return;
   }
@@ -171,6 +218,13 @@ function handleMsg(msg) {
   }
 
   if (msg.type === 'all_done') {
+    // Release the manual locks so the user's camera goes back to auto when
+    // they leave the page. Best-effort; OK if it fails.
+    if (videoTrack && lockSupported) {
+      videoTrack.applyConstraints({
+        advanced: [{ whiteBalanceMode: 'continuous', exposureMode: 'continuous', focusMode: 'continuous' }],
+      }).catch(() => {});
+    }
     doneScreen.classList.add('show');
   }
 }
