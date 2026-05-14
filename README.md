@@ -65,7 +65,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # macOS / Linux
 # Windows: https://docs.astral.sh/uv/getting-started/installation/
 
 # 1. Install ArgyllCMS so we can talk to your display
-brew install argyllcms          # macOS
+brew install argyll-cms          # macOS
 sudo apt install argyll         # Linux
 # Windows: https://www.argyllcms.com/downloadwin.html
 

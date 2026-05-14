@@ -1340,7 +1340,7 @@ pre { background: #222; padding: 1rem; border-radius: 6px; text-align: left; fon
   <p>Install <strong>ArgyllCMS</strong> and add <code>dispwin</code> to your PATH:</p>
   <pre>
 Windows: https://www.argyllcms.com/downloadwin.html
-Mac:     brew install argyllcms
+Mac:     brew install argyll-cms
 Linux:   sudo apt install argyll  (or dnf/pacman equivalent)
   </pre>
 </div>
@@ -2250,7 +2250,7 @@ def main():
             "\n[color-calibrator] ERROR: 'dispwin' not found on PATH.\n"
             "Install ArgyllCMS:\n"
             "  Windows: https://www.argyllcms.com/downloadwin.html\n"
-            "  Mac:     brew install argyllcms\n"
+            "  Mac:     brew install argyll-cms\n"
             "  Linux:   sudo apt install argyll\n"
         )
         sys.exit(1)

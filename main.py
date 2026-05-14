@@ -14,7 +14,7 @@ def main():
             "\n[color-calibrator] ERROR: 'dispwin' not found on PATH.\n"
             "Install ArgyllCMS:\n"
             "  Windows: https://www.argyllcms.com/downloadwin.html\n"
-            "  Mac:     brew install argyllcms\n"
+            "  Mac:     brew install argyll-cms\n"
             "  Linux:   sudo apt install argyll\n"
         )
         sys.exit(1)
