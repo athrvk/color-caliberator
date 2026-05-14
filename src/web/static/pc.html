@@ -34,7 +34,13 @@ Linux:   sudo apt install argyll  (or dnf/pacman equivalent)
   <p>1. Darken the room as much as possible.</p>
   <p>2. Hold your phone 30 cm from the centre of the screen, perpendicular to it.</p>
   <p>3. On your phone: tap <strong>Start Camera</strong>, then aim it at the screen.</p>
-  <p>4. When ready, click Begin below. The screen will show a white patch — lock your phone's <strong>exposure and white balance</strong>, then tap Ready on your phone.</p>
+  <div style="text-align:left; padding:1rem; background:#1a1a1a; border-radius:6px; width:100%;">
+    <p style="color:#eee; margin-bottom:0.5rem;"><strong>Calibration mode:</strong></p>
+    <label><input type="radio" name="mode" value="gamma" checked> Gamma only (automated, ~2 min)</label><br>
+    <label><input type="radio" name="mode" value="color"> Color (4 manual RAW photos required, ~5 min, ~3 ΔE)</label>
+    <p style="color:#888; font-size:0.85rem; margin-top:0.4rem;">Color mode requires DNG support and sRGB JPEG output. iOS: Settings → Camera → Formats → Most Compatible.</p>
+  </div>
+  <p>4. When ready, click Begin below.</p>
   <button id="begin-btn">Begin Calibration</button>
 </div>
 
@@ -105,7 +111,8 @@ ws.onmessage = (evt) => {
   if (msg.type === 'mobile_connected') {
     showScreen('setup');
     document.getElementById('begin-btn').onclick = () => {
-      ws.send(JSON.stringify({ type: 'start_calibration' }));
+      const mode = document.querySelector('input[name="mode"]:checked').value;
+      ws.send(JSON.stringify({ type: 'start_calibration', mode: mode }));
       document.getElementById('begin-btn').disabled = true;
       document.getElementById('begin-btn').textContent = 'Starting…';
     };
@@ -162,7 +169,13 @@ ws.onmessage = (evt) => {
   if (msg.type === 'result') {
     document.body.style.background = '#111';
     document.body.style.color = '#eee';
-    document.getElementById('delta-e-value').textContent = msg.delta_e.toFixed(2);
+    const dEl = document.getElementById('delta-e-value');
+    if (msg.mode === 'color') {
+      // Color mode has no ΔE; relabel the line entirely.
+      dEl.parentElement.textContent = 'Color profile generated';
+    } else {
+      dEl.textContent = (msg.delta_e ?? 0).toFixed(2);
+    }
     if (msg.before_b64) document.getElementById('before-img').src = `data:image/png;base64,${msg.before_b64}`;
     if (msg.after_b64)  document.getElementById('after-img').src  = `data:image/png;base64,${msg.after_b64}`;
 

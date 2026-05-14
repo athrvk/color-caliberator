@@ -37,6 +37,26 @@ right place.
 
 ---
 
+## Two modes
+
+**Gamma mode (default).** Automated, ~2 min. Fixes per-channel gamma and gray
+balance from 11 gray patches. Output: VCGT-only ICC. ΔE ~3-5 on grays.
+
+**Color mode (opt-in).** Adds 4 manual RAW (DNG) captures plus 33 patches.
+~5 minutes total. Fixes gray balance AND extends to white-point + primary
+chromaticities. Output: matrix-shaper ICC with TRC + VCGT. ΔE ~3 across the
+full gamut. Requires a phone that can capture DNG (iPhone Pro with ProRAW
+enabled, or Android via Open Camera / Halide / native pro modes).
+
+**Color mode prerequisites:**
+- Phone must capture DNG (RAW).
+- Phone JPEG output must be **sRGB**, not Display P3. iOS: Settings → Camera → Formats → Most Compatible. Otherwise the JPEG-stream patches are decoded with the wrong reverse curve and color accuracy drops to ~6 ΔE.
+- **iOS only:** the iOS Photos app silently transcodes DNG → JPEG when you pick a file in the browser. After shooting RAW, open Photos, share the photo, **Save to Files**, then upload from Files (not Photos). On Android: most file pickers preserve DNG; use whichever app saves the original.
+
+Choose mode on the PC setup screen.
+
+---
+
 ## Quick start (monkey mode)
 
 ```bash
@@ -93,6 +113,28 @@ The camera only needs to be **consistent across rounds**. It's comparing the
 display against itself, not against an absolute reference. Each round halves
 the residual error.
 
+### Color mode (Option B hybrid)
+
+When color mode is selected, the loop adds an **anchor phase** before measurement:
+
+```
+manual capture: white + R + G + B DNGs  ──┐
+                                          ▼
+   read DNG ForwardMatrix2 / AsShotNeutral
+   build camera-RGB → XYZ_D50 transform
+                                          │
+                                          ▼
+   automated patch stream (33 single-channel patches)
+   reverse sRGB; normalize vs white; project to primary XYZ
+   fit per-channel TRC in XYZ space
+                                          │
+                                          ▼
+   matrix-shaper ICC v2 (rXYZ/gXYZ/bXYZ + rTRC/gTRC/bTRC + VCGT)
+```
+
+The DNG tags give us factory-calibrated camera spectral data — same trick
+Apple TV Color Balance uses internally with iPhone sensors.
+
 ### Stack
 
 | Layer | Tech |
@@ -105,7 +147,7 @@ the residual error.
 | TLS | Self-signed cert via `cryptography`, auto-regen on LAN-IP change |
 | Mobile | Plain HTML/JS, `getUserMedia`, JPEG frames at 5 fps over WS |
 | QR | `qrcode[pil]` |
-| Tests | pytest + pytest-asyncio (37 tests) |
+| Tests | pytest + pytest-asyncio (49 tests) |
 
 ### Architecture in 30 seconds
 
@@ -126,7 +168,7 @@ src/web/
   server.py                   # FastAPI app + WebSocket session
   static/pc.html              # PC wizard
   static/mobile.html          # Mobile camera page
-tests/                        # 37 tests, all green
+tests/                        # 49 tests, all green
 ```
 
 ### Key design notes for contributors

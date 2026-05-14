@@ -27,6 +27,144 @@ SendFn = Callable[[dict], Awaitable[None]]
 RecvFn = Callable[[], Awaitable[dict]]
 DrainFn = Callable[[], Awaitable[None]]
 
+from calibration.raw import DngAnchor, parse_dng
+from calibration.color_pipeline import (
+    SRGB_PRIMARIES_XYZ_D50,
+    camera_rgb_to_xyz_d50,
+    fit_tone_response,
+    project_onto_primary,
+)
+
+AnchorWaitFn = Callable[[int], Awaitable[bytes]]
+
+
+def _srgb_to_linear(rgb_0_1: np.ndarray) -> np.ndarray:
+    """Reverse the sRGB encoding curve.
+
+    Assumes the phone encodes JPEGs in sRGB. iPhones since iOS 11 may use
+    Display P3 by default; users should set their camera to Most Compatible
+    (sRGB) for accurate color-mode results. See Task 12 README note.
+    """
+    a = 0.055
+    return np.where(rgb_0_1 <= 0.04045, rgb_0_1 / 12.92, ((rgb_0_1 + a) / (1 + a)) ** 2.4)
+
+
+async def _measure_color_patch(
+    level: float,
+    channel_idx: int,
+    patch_total: int,
+    patch_index: int,
+    round_num: int,
+    white_frame: np.ndarray,
+    white_anchor: DngAnchor,
+    pc_send: SendFn,
+    mobile_send: SendFn,
+    mobile_recv: RecvFn,
+    mobile_drain: DrainFn,
+) -> np.ndarray | None:
+    """Measure one single-channel patch and return measured XYZ_D50, or None."""
+    rgb = [0, 0, 0]
+    rgb[channel_idx] = int(round(level * 255))
+    await pc_send({"type": "show_patch", "rgb": rgb})
+    await pc_send({"type": "capturing", "round": round_num})
+    await asyncio.sleep(SETTLE_DELAY)
+    await mobile_drain()
+    await mobile_send({"type": "capture", "n": patch_index + 1, "total": patch_total})
+    frame = await _wait_for_stable_frames(mobile_recv)
+    await mobile_send({"type": "stop_capture"})
+    await pc_send({"type": "patch_done", "n": patch_index + 1, "total": patch_total, "round": round_num})
+    await mobile_send({"type": "patch_done", "n": patch_index + 1, "total": patch_total})
+    if frame is None:
+        return None
+
+    h, w = frame.shape[:2]
+    patch_rgb = frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4].mean(axis=(0, 1)) / 255.0
+    white_rgb = white_frame[h // 4 : 3 * h // 4, w // 4 : 3 * w // 4].mean(axis=(0, 1)) / 255.0
+
+    patch_linear = _srgb_to_linear(patch_rgb)
+    white_linear = np.clip(_srgb_to_linear(white_rgb), 1e-6, None)
+    relative_rgb = patch_linear / white_linear
+
+    return camera_rgb_to_xyz_d50(relative_rgb, white_anchor.as_shot_neutral, white_anchor.forward_matrix_2)
+
+
+async def _run_color_rounds(
+    white_frame: np.ndarray,
+    anchors: dict[int, DngAnchor],
+    pc_send: SendFn,
+    mobile_send: SendFn,
+    mobile_recv: RecvFn,
+    mobile_drain: DrainFn,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    """Run color-mode patch loop. Returns (r_trc, g_trc, b_trc, primary_xyz_d50)."""
+    white_anchor = anchors[0]
+    levels = np.array([p.level for p in GRAY_PATCHES])
+
+    primary_xyz: dict[str, np.ndarray] = {}
+    for ch_name, seq in [("R", 1), ("G", 2), ("B", 3)]:
+        a = anchors[seq]
+        primary_xyz[ch_name] = camera_rgb_to_xyz_d50(
+            a.linear_rgb_sample, a.as_shot_neutral, a.forward_matrix_2,
+        )
+
+    channels = [("R", 0), ("G", 1), ("B", 2)]
+    per_channel_projections: dict[str, list[float]] = {"R": [], "G": [], "B": []}
+    total = len(levels) * 3
+    patch_index = 0
+
+    for ch_name, ch_idx in channels:
+        primary = primary_xyz[ch_name]
+        for level in levels:
+            measured_xyz = await _measure_color_patch(
+                float(level), ch_idx, total, patch_index, 1,
+                white_frame, white_anchor,
+                pc_send, mobile_send, mobile_recv, mobile_drain,
+            )
+            patch_index += 1
+            if measured_xyz is None:
+                per_channel_projections[ch_name].append(float(level) ** 2.2)
+                continue
+            per_channel_projections[ch_name].append(
+                project_onto_primary(measured_xyz, primary)
+            )
+
+    def _rescale_to_unit(ch_name: str) -> np.ndarray:
+        projections = np.array(per_channel_projections[ch_name], dtype=float)
+        ref = max(projections[-1], 1e-6)
+        return projections / ref
+
+    r_trc = fit_tone_response(levels, _rescale_to_unit("R"))
+    g_trc = fit_tone_response(levels, _rescale_to_unit("G"))
+    b_trc = fit_tone_response(levels, _rescale_to_unit("B"))
+
+    return r_trc, g_trc, b_trc, primary_xyz
+
+
+_ANCHOR_PROMPTS = [
+    (0, "WHITE", (255, 255, 255)),
+    (1, "RED",   (255, 0,   0)),
+    (2, "GREEN", (0,   255, 0)),
+    (3, "BLUE",  (0,   0,   255)),
+]
+
+
+async def _capture_anchors(
+    pc_send: SendFn,
+    mobile_send: SendFn,
+    wait_for_anchor: AnchorWaitFn,
+    tmp_dir: Path,
+) -> dict[int, DngAnchor]:
+    """Drive the 4-shot manual RAW anchor flow."""
+    parsed: dict[int, DngAnchor] = {}
+    for seq, label, rgb in _ANCHOR_PROMPTS:
+        await pc_send({"type": "show_patch", "rgb": list(rgb)})
+        await mobile_send({"type": "request_raw", "seq": seq, "label": label})
+        data = await wait_for_anchor(seq)
+        dng_path = tmp_dir / f"anchor_{seq}.dng"
+        await asyncio.to_thread(dng_path.write_bytes, data)
+        parsed[seq] = await asyncio.to_thread(parse_dng, dng_path)
+    return parsed
+
 SSNR_THRESHOLD = 20.0
 STABLE_FRAMES = 5
 CAPTURE_TIMEOUT = 10.0    # seconds per patch
@@ -166,12 +304,34 @@ async def run_calibration(
     mobile_recv: RecvFn,
     mobile_drain: DrainFn,
     tmp_dir: Path,
+    mode: str = "gamma",
+    wait_for_anchor: AnchorWaitFn | None = None,
 ) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
     """
     Run the full iterative calibration session.
     Returns (icc_bytes, final_delta_e, lut_r, lut_g, lut_b).
     """
+    if mode == "color":
+        if wait_for_anchor is None:
+            raise RuntimeError("color mode requires wait_for_anchor callback")
+        anchors = await _capture_anchors(pc_send, mobile_send, wait_for_anchor, tmp_dir)
+    else:
+        anchors = None
+
     white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain)
+
+    if mode == "color":
+        r_trc, g_trc, b_trc, primary_xyz = await _run_color_rounds(
+            white_frame, anchors, pc_send, mobile_send, mobile_recv, mobile_drain,
+        )
+        from display.profile import build_matrix_shaper_profile
+        icc_bytes = build_matrix_shaper_profile(
+            r_trc, g_trc, b_trc,
+            primary_xyz["R"], primary_xyz["G"], primary_xyz["B"],
+        )
+        await pc_send({"type": "round_done", "round": 1})
+        await mobile_send({"type": "round_done"})
+        return icc_bytes, float("nan"), r_trc, g_trc, b_trc
 
     lut_r = identity_lut()
     lut_g = identity_lut()

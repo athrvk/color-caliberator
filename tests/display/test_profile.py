@@ -2,7 +2,7 @@ import struct
 
 import numpy as np
 
-from display.profile import build_vcgt_profile
+from display.profile import build_matrix_shaper_profile, build_vcgt_profile
 
 
 def _identity_luts():
@@ -68,3 +68,49 @@ def test_vcgt_lut_roundtrip():
     g_start = pos + 18 + 512
     first_g = struct.unpack(">H", data[g_start : g_start + 2])[0]
     assert first_g == 32767
+
+
+def _identity_curves():
+    return np.linspace(0, 1, 256).astype(np.float64)
+
+
+def test_matrix_shaper_returns_bytes():
+    r = g = b = _identity_curves()
+    r_xyz_d50 = np.array([0.4361, 0.2225, 0.0139])
+    g_xyz_d50 = np.array([0.3851, 0.7169, 0.0971])
+    b_xyz_d50 = np.array([0.1431, 0.0606, 0.7141])
+    data = build_matrix_shaper_profile(r, g, b, r_xyz_d50, g_xyz_d50, b_xyz_d50)
+    assert isinstance(data, bytes)
+    assert data[36:40] == b"acsp"
+    assert data[12:16] == b"mntr"
+    assert b"rXYZ" in data
+    assert b"rTRC" in data
+    assert b"vcgt" in data
+
+
+def test_matrix_shaper_size_matches_declared():
+    r = g = b = _identity_curves()
+    r_xyz = np.array([0.4361, 0.2225, 0.0139])
+    g_xyz = np.array([0.3851, 0.7169, 0.0971])
+    b_xyz = np.array([0.1431, 0.0606, 0.7141])
+    data = build_matrix_shaper_profile(r, g, b, r_xyz, g_xyz, b_xyz)
+    declared = struct.unpack(">I", data[:4])[0]
+    assert declared == len(data)
+
+
+def test_matrix_shaper_trc_count_is_256():
+    r = g = b = _identity_curves()
+    r_xyz = np.array([0.4361, 0.2225, 0.0139])
+    g_xyz = np.array([0.3851, 0.7169, 0.0971])
+    b_xyz = np.array([0.1431, 0.0606, 0.7141])
+    data = build_matrix_shaper_profile(r, g, b, r_xyz, g_xyz, b_xyz)
+    count_tags = struct.unpack(">I", data[128:132])[0]
+    found_offset = None
+    for i in range(count_tags):
+        entry = 132 + i * 12
+        if data[entry : entry + 4] == b"rTRC":
+            found_offset = struct.unpack(">I", data[entry + 4 : entry + 8])[0]
+            break
+    assert found_offset is not None
+    declared_count = struct.unpack(">I", data[found_offset + 8 : found_offset + 12])[0]
+    assert declared_count == 256

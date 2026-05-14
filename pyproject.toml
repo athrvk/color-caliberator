@@ -12,6 +12,9 @@ dependencies = [
     "cryptography",
     "pytest",
     "pytest-asyncio",
+    "rawpy",
+    "tifffile",
+    "python-multipart>=0.0.28",
 ]
 
 [build-system]

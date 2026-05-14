@@ -26,6 +26,8 @@ canvas { display: none; }
   <div id="ssnr-bar-wrap"><div id="ssnr-bar"></div></div>
   <button id="start-cam-btn">Start Camera</button>
   <button id="ready-btn">Ready</button>
+  <input type="file" id="raw-input" accept=".dng,image/x-adobe-dng" style="display:none;">
+  <button id="upload-raw-btn" style="pointer-events:auto; padding:1rem 3rem; background:#f5a623; color:#fff; border:none; border-radius:30px; font-size:1.2rem; cursor:pointer; display:none;">Upload RAW Photo</button>
 </div>
 <div id="flash"></div>
 
@@ -76,6 +78,39 @@ function connectWs() {
 
   ws.onmessage = (evt) => {
     const msg = JSON.parse(evt.data);
+
+    if (msg.type === 'request_raw') {
+      status.textContent = `Shoot a RAW (DNG) photo of the ${msg.label} patch on the PC screen. iOS: Save to Files first, then upload from Files. Android: pick from your camera roll.`;
+      const uploadBtn = document.getElementById('upload-raw-btn');
+      const fileInput = document.getElementById('raw-input');
+      uploadBtn.style.display = 'block';
+      uploadBtn.textContent = `Upload ${msg.label} RAW (#${msg.seq + 1})`;
+      uploadBtn.onclick = () => fileInput.click();
+      fileInput.onchange = (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const form = new FormData();
+        form.append('file', file);
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', `/upload/raw/${msg.seq}`);
+        xhr.upload.onprogress = (ev) => {
+          if (!ev.lengthComputable) return;
+          const pct = Math.round((ev.loaded / ev.total) * 100);
+          status.textContent = `Uploading ${file.name}… ${pct}%`;
+        };
+        xhr.onload = () => {
+          if (xhr.status < 200 || xhr.status >= 300) {
+            status.textContent = 'Upload failed: ' + xhr.statusText;
+            return;
+          }
+          status.textContent = `Uploaded ${file.name}. Waiting for next instruction…`;
+          uploadBtn.style.display = 'none';
+        };
+        xhr.onerror = () => { status.textContent = 'Upload failed: network error'; };
+        xhr.send(form);
+      };
+      return;
+    }
 
     if (msg.type === 'show_white_for_wb') {
       status.textContent = 'Lock exposure and white balance on this white screen, then tap Ready.';
@@ -131,6 +166,14 @@ function connectWs() {
     status.textContent = 'Disconnected. Reload to reconnect.';
   };
 }
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible'
+      && (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING)) {
+    status.textContent = 'Reconnecting…';
+    connectWs();
+  }
+});
 
 function startCapturing() {
   if (captureInterval) return;
