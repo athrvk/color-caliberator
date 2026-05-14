@@ -229,6 +229,7 @@ async def _run_calibration_task() -> None:
     pc, mobile = session.pc, session.mobile
     if pc is None or mobile is None:
         return
+    mode = session.mode
 
     async def pc_send(msg: dict) -> None:
         await _send(pc.ws, msg)
@@ -267,16 +268,21 @@ async def _run_calibration_task() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         try:
             icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
-                pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp)
+                pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp),
+                mode=mode,
+                wait_for_anchor=wait_for_anchor,
             )
             icc_b64 = base64.b64encode(icc_bytes).decode()
+            import math
+            delta_e_payload = None if math.isnan(delta_e) else delta_e
             chart_path = STATIC_DIR / "test_chart.png"
             _ensure_test_chart(chart_path)
             before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
             await _send(pc.ws, {
                 "type": "result",
+                "mode": mode,
                 "icc_b64": icc_b64,
-                "delta_e": delta_e,
+                "delta_e": delta_e_payload,
                 "before_b64": before_b64,
                 "after_b64": after_b64,
             })
