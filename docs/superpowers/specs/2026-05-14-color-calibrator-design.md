@@ -118,9 +118,8 @@ Each round:
    - Normalizes measured RGB against session white reference to cancel camera WB drift
 
 **Ramp computation (`ramp.py`):**
-- For each gray patch, compute the ratio: `measured_luminance / target_luminance`
-- Fit a per-channel correction curve using `scipy.curve_fit` (power law: `output = input ^ correction_gamma`)
-- Build a 256-entry per-channel float LUT from the fitted curve (values in [0.0, 1.0])
+- For each gray patch, fit the display's effective gamma `γ_d` against the model `measured_luminance ≈ input ^ γ_d` using `scipy.curve_fit`
+- Build a 256-entry per-channel float LUT: `LUT(x) = x ^ (γ_target / γ_d)` where `γ_target = 2.2` — this is the pre-warp that makes `display(LUT(x))` track the target gamma
 - Compose with the current LUT (if round > 1) via `np.interp`
 
 **Apply ramp (`platform/dispwin.py` + `platform/profile.py`):**
@@ -220,16 +219,17 @@ from scipy.optimize import curve_fit
 
 # input_levels: [0.0, 0.1, 0.2, ..., 1.0] — display RGB input (skip 0.0 for curve_fit)
 # measured_luma: camera-measured luminance for each patch (normalized vs white)
-# target_luma:   expected luminance for gamma 2.2 display: input^2.2
+# Model: measured = input^γ_d. Solve for γ_d, then LUT(x) = x^(2.2/γ_d).
 
-def fit_correction(input_levels, measured_luma, target_luma):
+def fit_correction(input_levels, measured_luma, target_gamma=2.2):
     # Exclude black (input=0) — camera black level is unreliable
     mask = input_levels > 0
-    ratio = target_luma[mask] / measured_luma[mask]
-    correction_gamma, _ = curve_fit(
-        lambda x, g: x**g, input_levels[mask], ratio, p0=[1.0]
+    (gamma_d,), _ = curve_fit(
+        lambda x, g: x**g, input_levels[mask], measured_luma[mask],
+        p0=[2.2], bounds=(0.5, 5.0),
     )
-    lut = np.clip(np.linspace(0, 1, 256) ** correction_gamma[0], 0, 1)
+    exponent = target_gamma / gamma_d
+    lut = np.clip(np.linspace(0, 1, 256) ** exponent, 0, 1)
     return lut  # float [0, 1]
 
 def compose_luts(prev_lut: np.ndarray, new_lut: np.ndarray) -> np.ndarray:

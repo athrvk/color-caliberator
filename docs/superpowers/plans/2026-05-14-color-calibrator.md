@@ -26,6 +26,7 @@
 | `src/display/profile.py` | `build_vcgt_profile` → ICC v2 bytes with VCGT tag |
 | `src/util/__init__.py` | Empty |
 | `src/util/qr.py` | `generate_qr_png(url) → bytes` |
+| `src/util/tls.py` | `ensure_cert`, `detect_lan_ip` — self-signed TLS cert for getUserMedia |
 | `src/web/__init__.py` | Empty |
 | `src/web/server.py` | FastAPI app, WebSocket endpoints, session state |
 | `src/web/static/pc.html` | PC wizard: QR → setup → progress → result |
@@ -34,6 +35,7 @@
 | `tests/calibration/test_patches.py` | |
 | `tests/calibration/test_capture.py` | |
 | `tests/calibration/test_ramp.py` | |
+| `tests/calibration/test_iterate.py` | Integration test: fake send/recv driving `run_calibration` |
 | `tests/display/test_dispwin.py` | |
 | `tests/display/test_profile.py` | |
 
@@ -62,6 +64,7 @@ dependencies = [
     "scipy",
     "pillow",
     "qrcode[pil]",
+    "cryptography",
     "pytest",
     "pytest-asyncio",
 ]
@@ -378,23 +381,20 @@ def test_identity_lut_shape_and_endpoints():
 
 
 def test_fit_correction_perfect_display_returns_identity():
-    # If measured == target, correction should be identity (gamma ≈ 1.0)
+    # Display already at γ=2.2 → correction is identity.
     levels = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-    target = np.where(levels > 0, levels ** 2.2, 0.0)
-    measured = target.copy()
-    lut = fit_correction(levels, measured, target)
+    measured = np.where(levels > 0, levels ** 2.2, 0.0)
+    lut = fit_correction(levels, measured)
     expected = identity_lut()
     np.testing.assert_allclose(lut, expected, atol=0.02)
 
 
 def test_fit_correction_too_bright_darkens():
-    # measured brighter than target → correction should darken (LUT values < identity)
+    # Display gamma 1.5 (too bright at midtones) → LUT exponent = 2.2/1.5 > 1 → darken.
     levels = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0])
-    target = np.where(levels > 0, levels ** 2.2, 0.0)
-    measured = np.where(levels > 0, levels ** 1.5, 0.0)  # too bright
-    lut = fit_correction(levels, measured, target)
+    measured = np.where(levels > 0, levels ** 1.5, 0.0)
+    lut = fit_correction(levels, measured)
     identity = identity_lut()
-    # Midpoint should be darker than identity
     assert lut[128] < identity[128]
 
 
@@ -462,28 +462,30 @@ def identity_lut() -> np.ndarray:
 def fit_correction(
     input_levels: np.ndarray,
     measured_luma: np.ndarray,
-    target_luma: np.ndarray,
+    target_gamma: float = 2.2,
 ) -> np.ndarray:
     """
-    Fit a per-channel gamma correction curve.
+    Fit the display's effective gamma γ_d from (input, measured_luma) pairs,
+    then build a pre-warp LUT so the composed pipeline matches target_gamma.
 
-    input_levels: display input values [0..1], length N
-    measured_luma: camera-measured relative luminance, length N (normalized vs white)
-    target_luma:   expected relative luminance for gamma 2.2, length N
+    Physical model:
+        measured_luma ≈ input_levels ** γ_d
+    To make `display(LUT(x)) = x^target_gamma`, we need
+        LUT(x) = x ** (target_gamma / γ_d)
 
-    Returns float [0, 1] LUT of length 256.
     Black (input=0) is excluded — phone camera black level is unreliable.
     """
     mask = input_levels > 0.0
-    ratio = target_luma[mask] / np.clip(measured_luma[mask], 1e-6, None)
-    (gamma,), _ = curve_fit(
+    measured = np.clip(measured_luma[mask], 1e-6, None)
+    (gamma_d,), _ = curve_fit(
         lambda x, g: x ** g,
         input_levels[mask],
-        ratio,
-        p0=[1.0],
-        bounds=(0.1, 10.0),
+        measured,
+        p0=[2.2],
+        bounds=(0.5, 5.0),
     )
-    return np.clip(np.linspace(0.0, 1.0, 256) ** gamma, 0.0, 1.0)
+    exponent = target_gamma / gamma_d
+    return np.clip(np.linspace(0.0, 1.0, 256) ** exponent, 0.0, 1.0)
 
 
 def compose_luts(prev_lut: np.ndarray, new_lut: np.ndarray) -> np.ndarray:
@@ -510,7 +512,13 @@ def apply_lut_to_image(
     """
     Apply float [0,1] per-channel LUTs to an H×W×3 uint8 image.
     Returns a new uint8 array (does not modify img).
+
+    LUTs MUST be float [0, 1] (not the uint16 VCGT form). Passing uint16 LUTs
+    here would scale 65535 → 255 and clip everything to white.
     """
+    for name, lut in (("r", r_lut), ("g", g_lut), ("b", b_lut)):
+        if lut.dtype == np.uint16:
+            raise TypeError(f"{name}_lut is uint16 (VCGT form); pass float [0,1] LUTs")
     # Scale each float LUT to 0-255 for indexing
     r256 = np.clip(np.round(r_lut * 255.0), 0, 255).astype(np.uint8)
     g256 = np.clip(np.round(g_lut * 255.0), 0, 255).astype(np.uint8)
@@ -685,16 +693,26 @@ def test_vcgt_tag_present_in_data():
     assert b"vcgt" in data
 
 
+def _vcgt_offset(data: bytes) -> int:
+    """Walk the ICC tag table and return the byte offset of the vcgt type block."""
+    count = struct.unpack(">I", data[128:132])[0]
+    for i in range(count):
+        entry = 132 + i * 12
+        sig = data[entry : entry + 4]
+        if sig == b"vcgt":
+            return struct.unpack(">I", data[entry + 4 : entry + 8])[0]
+    raise AssertionError("vcgt tag not found in tag table")
+
+
 def test_vcgt_lut_roundtrip():
     # Build a known LUT and verify it appears in the profile bytes
     r = np.zeros(256, dtype=np.uint16)
     g = np.full(256, 32767, dtype=np.uint16)
     b = np.full(256, 65535, dtype=np.uint16)
     data = build_vcgt_profile(r, g, b)
-    # Find vcgt tag in data and check first G entry
-    pos = data.index(b"vcgt")
-    # Skip: sig(4) + reserved(4) + type(4) + channels(2) + count(2) + size(2) = 18 bytes
-    # Then R entries (512 bytes), then G entries start
+    pos = _vcgt_offset(data)
+    # vcgt type header: sig(4) + reserved(4) + gamma_type(4) + channels(2) + count(2) + entry_size(2) = 18 bytes
+    # Then R entries (256 * 2 = 512 bytes), then G entries start.
     g_start = pos + 18 + 512
     first_g = struct.unpack(">H", data[g_start : g_start + 2])[0]
     assert first_g == 32767
@@ -898,12 +916,135 @@ git commit -m "feat: QR code generator for mobile URL"
 
 ---
 
+## Task 7b: TLS Self-Signed Certificate
+
+**Why:** Mobile browsers gate `navigator.mediaDevices.getUserMedia` to secure contexts (HTTPS or `localhost`). Plain `http://<lan-ip>:8765` will produce `undefined` and the camera never starts. Solution: self-signed cert covering 127.0.0.1 + detected LAN IP, generated at startup, served via uvicorn's `--ssl-keyfile`/`--ssl-certfile`. User accepts the browser warning once per session.
+
+**Files:**
+- Create: `src/util/tls.py`
+
+- [ ] **Step 1: Implement `src/util/tls.py`**
+
+```python
+import ipaddress
+import socket
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
+
+
+def detect_lan_ip() -> str:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+def ensure_cert(cert_dir: Path) -> tuple[Path, Path]:
+    """
+    Generate (or reuse) a self-signed cert + key covering 127.0.0.1 and the
+    current LAN IP. Returns (cert_path, key_path).
+
+    Regenerates if the cert is missing, expired, or does not include the
+    current LAN IP (handles laptop moving networks).
+    """
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    cert_path = cert_dir / "server.crt"
+    key_path = cert_dir / "server.key"
+
+    lan_ip = detect_lan_ip()
+    if _cert_valid_for(cert_path, lan_ip):
+        return cert_path, key_path
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.now(tz=timezone.utc)
+    san = x509.SubjectAlternativeName([
+        x509.IPAddress(ipaddress.IPv4Address("127.0.0.1")),
+        x509.IPAddress(ipaddress.IPv4Address(lan_ip)),
+        x509.DNSName("localhost"),
+    ])
+    subject = issuer = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, "color-calibrator"),
+    ])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=1))
+        .not_valid_after(now + timedelta(days=825))
+        .add_extension(san, critical=False)
+        .sign(key, hashes.SHA256())
+    )
+
+    key_path.write_bytes(key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    ))
+    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    return cert_path, key_path
+
+
+def _cert_valid_for(cert_path: Path, lan_ip: str) -> bool:
+    if not cert_path.exists():
+        return False
+    try:
+        cert = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        if cert.not_valid_after_utc < datetime.now(tz=timezone.utc):
+            return False
+        san = cert.extensions.get_extension_for_class(
+            x509.SubjectAlternativeName
+        ).value
+        ips = [str(v) for v in san.get_values_for_type(x509.IPAddress)]
+        return lan_ip in ips
+    except Exception:
+        return False
+```
+
+- [ ] **Step 2: Smoke test**
+
+```bash
+uv run python -c "
+import sys; sys.path.insert(0, 'src')
+from pathlib import Path
+from util.tls import ensure_cert, detect_lan_ip
+c, k = ensure_cert(Path('.cert'))
+print(f'cert={c} key={k} lan={detect_lan_ip()}')
+"
+```
+Expected: paths printed, `.cert/server.crt` + `.cert/server.key` exist.
+
+- [ ] **Step 3: Add `.cert/` to `.gitignore`**
+
+```bash
+echo ".cert/" >> .gitignore
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add src/util/tls.py .gitignore
+git commit -m "feat: self-signed TLS cert generator covering LAN IP for getUserMedia"
+```
+
+---
+
 ## Task 8: FastAPI Server and WebSocket Routing
 
 **Files:**
 - Create: `src/web/server.py`
 
 The server manages a single calibration session at a time. PC connects first, gets the QR code. When mobile connects, calibration setup begins. The WebSocket protocol is message-passing with JSON.
+
+**Single-reader-per-socket invariant:** Each WebSocket has exactly one task calling `receive_text` — a per-socket reader that pushes parsed messages into an `asyncio.Queue`. Calibration callbacks (`pc_recv`/`mobile_recv`) consume from the queue. Concurrent `receive_text` calls on the same `WebSocket` raise `RuntimeError` in Starlette, so the queue indirection is mandatory.
 
 - [ ] **Step 1: Implement `src/web/server.py`**
 
@@ -916,12 +1057,12 @@ import sys
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from display.dispwin import apply_ramp, clear_ramp, find_dispwin
+from display.dispwin import find_dispwin
 from util.qr import generate_qr_png
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -932,18 +1073,40 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # ---------- Session state (single session) ----------
 
+class Endpoint:
+    """One side of the session: WebSocket + inbound message queue."""
+
+    def __init__(self, ws: WebSocket):
+        self.ws = ws
+        self.queue: asyncio.Queue[dict] = asyncio.Queue()
+        self.closed = asyncio.Event()
+
+
 class Session:
     def __init__(self):
-        self.pc: WebSocket | None = None
-        self.mobile: WebSocket | None = None
+        self.pc: Endpoint | None = None
+        self.mobile: Endpoint | None = None
+        self.calibration_task: asyncio.Task | None = None
         self.lock = asyncio.Lock()
-
-    def reset(self):
-        self.pc = None
-        self.mobile = None
 
 
 session = Session()
+
+
+async def _reader(endpoint: Endpoint) -> None:
+    """Single task per WebSocket: pump parsed messages into the queue."""
+    try:
+        while True:
+            text = await endpoint.ws.receive_text()
+            try:
+                msg = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            await endpoint.queue.put(msg)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        endpoint.closed.set()
 
 
 def _local_ip() -> str:
@@ -972,8 +1135,9 @@ async def mobile_page():
 @app.websocket("/ws/pc")
 async def ws_pc(websocket: WebSocket):
     await websocket.accept()
+    endpoint = Endpoint(websocket)
     async with session.lock:
-        session.pc = websocket
+        session.pc = endpoint
 
     dispwin_path = find_dispwin()
     if dispwin_path is None:
@@ -982,27 +1146,41 @@ async def ws_pc(websocket: WebSocket):
             "message": "dispwin not found — install ArgyllCMS and add it to PATH.",
         })
         await websocket.close()
+        session.pc = None
         return
 
     ip = _local_ip()
-    mobile_url = f"http://{ip}:8765/mobile"
+    mobile_url = f"https://{ip}:8765/mobile"
     qr_png = generate_qr_png(mobile_url)
     qr_b64 = base64.b64encode(qr_png).decode()
-
     await _send(websocket, {"type": "qr_code", "png_b64": qr_b64, "url": mobile_url})
 
+    # Single reader for this socket. All other code consumes from endpoint.queue.
+    reader = asyncio.create_task(_reader(endpoint))
+    control = asyncio.create_task(_pc_control_loop(endpoint))
     try:
-        while True:
-            msg = await _recv(websocket)
-            # Delegate message handling to iterate.py after mobile connects
-            if msg.get("type") == "start_calibration":
-                if session.mobile is None:
-                    await _send(websocket, {"type": "error", "message": "Mobile not connected."})
+        await endpoint.closed.wait()
+    finally:
+        reader.cancel()
+        control.cancel()
+        async with session.lock:
+            if session.pc is endpoint:
+                session.pc = None
+
+
+async def _pc_control_loop(pc: "Endpoint") -> None:
+    """Consume PC-originated messages. Currently: start_calibration trigger."""
+    while not pc.closed.is_set():
+        msg = await pc.queue.get()
+        if msg.get("type") == "start_calibration":
+            async with session.lock:
+                mobile = session.mobile
+                if mobile is None:
+                    await _send(pc.ws, {"type": "error", "message": "Mobile not connected."})
                     continue
-                # Run calibration in background task so WebSocket stays alive
-                asyncio.create_task(_run_calibration_task())
-    except WebSocketDisconnect:
-        session.pc = None
+                if session.calibration_task and not session.calibration_task.done():
+                    continue  # already running
+                session.calibration_task = asyncio.create_task(_run_calibration_task())
 
 
 # ---------- WebSocket: Mobile ----------
@@ -1010,30 +1188,32 @@ async def ws_pc(websocket: WebSocket):
 @app.websocket("/ws/mobile")
 async def ws_mobile(websocket: WebSocket):
     await websocket.accept()
+    endpoint = Endpoint(websocket)
     async with session.lock:
-        session.mobile = websocket
+        session.mobile = endpoint
+        pc = session.pc
 
-    if session.pc is not None:
-        await _send(session.pc, {"type": "mobile_connected"})
+    if pc is not None:
+        await _send(pc.ws, {"type": "mobile_connected"})
+        # PC's setup screen now shows a Begin button; calibration starts when
+        # the user clicks it (PC sends `start_calibration`).
 
+    reader = asyncio.create_task(_reader(endpoint))
     try:
-        while True:
-            await _recv(websocket)  # keep alive; iterate.py drives the protocol
-    except WebSocketDisconnect:
-        session.mobile = None
-        if session.pc is not None:
-            await _send(session.pc, {"type": "error", "message": "Mobile disconnected."})
+        await endpoint.closed.wait()
+    finally:
+        reader.cancel()
+        async with session.lock:
+            if session.mobile is endpoint:
+                session.mobile = None
+        if pc is not None and not pc.closed.is_set():
+            await _send(pc.ws, {"type": "error", "message": "Mobile disconnected."})
 
 
 # ---------- Helpers ----------
 
 async def _send(ws: WebSocket, msg: dict) -> None:
     await ws.send_text(json.dumps(msg))
-
-
-async def _recv(ws: WebSocket) -> dict:
-    text = await ws.receive_text()
-    return json.loads(text)
 
 
 async def _run_calibration_task() -> None:
@@ -1045,16 +1225,18 @@ async def _run_calibration_task() -> None:
         return
 
     async def pc_send(msg: dict) -> None:
-        await _send(pc, msg)
-
-    async def pc_recv() -> dict:
-        return await _recv(pc)
+        await _send(pc.ws, msg)
 
     async def mobile_send(msg: dict) -> None:
-        await _send(mobile, msg)
+        await _send(mobile.ws, msg)
 
     async def mobile_recv() -> dict:
-        return await _recv(mobile)
+        return await mobile.queue.get()
+
+    async def mobile_drain() -> None:
+        """Discard any queued mobile messages (stale frames between patches)."""
+        while not mobile.queue.empty():
+            mobile.queue.get_nowait()
 
     import tempfile
     from pathlib import Path
@@ -1062,13 +1244,13 @@ async def _run_calibration_task() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         try:
             icc_bytes, delta_e = await run_calibration(
-                pc_send, pc_recv, mobile_send, mobile_recv, Path(tmp)
+                pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp)
             )
             icc_b64 = base64.b64encode(icc_bytes).decode()
-            await _send(pc, {"type": "result", "icc_b64": icc_b64, "delta_e": delta_e})
-            await _send(mobile, {"type": "all_done"})
+            await _send(pc.ws, {"type": "result", "icc_b64": icc_b64, "delta_e": delta_e})
+            await _send(mobile.ws, {"type": "all_done"})
         except Exception as exc:
-            await _send(pc, {"type": "error", "message": str(exc)})
+            await _send(pc.ws, {"type": "error", "message": str(exc)})
 ```
 
 - [ ] **Step 2: Verify server imports cleanly**
@@ -1176,8 +1358,9 @@ Linux:   sudo apt install argyll  (or dnf/pacman equivalent)
   <h1>Setup</h1>
   <p>1. Darken the room as much as possible.</p>
   <p>2. Hold your phone 30 cm from the centre of the screen, perpendicular to it.</p>
-  <p>3. The screen will now show a white patch. Lock your phone's <strong>exposure and white balance</strong> on it, then tap Ready on your phone.</p>
-  <p>Waiting for you to lock white balance and tap Ready on mobile…</p>
+  <p>3. On your phone: tap <strong>Start Camera</strong>, then aim it at the screen.</p>
+  <p>4. When ready, click Begin below. The screen will show a white patch — lock your phone's <strong>exposure and white balance</strong>, then tap Ready on your phone.</p>
+  <button id="begin-btn">Begin Calibration</button>
 </div>
 
 <!-- Screen 4: Measuring -->
@@ -1225,7 +1408,8 @@ function showScreen(name) {
   screens[name].classList.add('active');
 }
 
-const ws = new WebSocket(`ws://${location.host}/ws/pc`);
+const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const ws = new WebSocket(`${wsScheme}//${location.host}/ws/pc`);
 
 ws.onmessage = (evt) => {
   const msg = JSON.parse(evt.data);
@@ -1245,20 +1429,19 @@ ws.onmessage = (evt) => {
 
   if (msg.type === 'mobile_connected') {
     showScreen('setup');
-    return;
-  }
-
-  if (msg.type === 'white_patch') {
-    document.body.style.background = '#fff';
-    document.body.style.color = '#fff';
-    // Full white screen — all other screens hidden
-    showScreen('setup');
+    document.getElementById('begin-btn').onclick = () => {
+      ws.send(JSON.stringify({ type: 'start_calibration' }));
+      document.getElementById('begin-btn').disabled = true;
+      document.getElementById('begin-btn').textContent = 'Starting…';
+    };
     return;
   }
 
   if (msg.type === 'show_patch') {
     const [r, g, b] = msg.rgb;
     document.body.style.background = `rgb(${r},${g},${b})`;
+    // Hide all wizard chrome so the camera measures a clean full-screen patch.
+    Object.values(screens).forEach(s => s.classList.remove('active'));
     return;
   }
 
@@ -1268,7 +1451,9 @@ ws.onmessage = (evt) => {
     document.getElementById('patch-total').textContent = msg.total;
     const pct = (msg.n / msg.total * 100).toFixed(0);
     document.getElementById('progress-fill').style.width = pct + '%';
-    document.getElementById('round-num').textContent = msg.round;
+    if (msg.round && msg.round > 0) {
+      document.getElementById('round-num').textContent = msg.round;
+    }
     const badge = document.getElementById('ssnr-badge');
     badge.textContent = 'Captured ✓';
     badge.className = 'ssnr-indicator ssnr-stable';
@@ -1276,12 +1461,20 @@ ws.onmessage = (evt) => {
     return;
   }
 
+  if (msg.type === 'holdout_started') {
+    document.querySelector('#s-measuring h1').textContent = 'Verifying Calibration';
+    document.getElementById('patch-total').textContent = msg.total;
+    document.getElementById('progress-fill').style.width = '0%';
+    showScreen('measuring');
+    return;
+  }
+
   if (msg.type === 'capturing') {
+    // Keep wizard chrome hidden during capture so the patch fills the screen.
     document.getElementById('round-num').textContent = msg.round;
     const badge = document.getElementById('ssnr-badge');
     badge.textContent = 'Waiting for stable frame…';
     badge.className = 'ssnr-indicator ssnr-waiting';
-    showScreen('measuring');
     return;
   }
 
@@ -1360,7 +1553,8 @@ body { background: #000; color: #fff; font-family: system-ui, sans-serif; height
 #status { background: rgba(0,0,0,0.7); padding: 0.6rem 1.2rem; border-radius: 20px; font-size: 1rem; }
 #ssnr-bar-wrap { width: 80%; height: 10px; background: rgba(255,255,255,0.2); border-radius: 5px; overflow: hidden; }
 #ssnr-bar { height: 100%; width: 0%; background: #4caf50; transition: width 0.2s, background 0.2s; }
-#ready-btn { pointer-events: auto; padding: 1rem 3rem; background: #4caf50; color: #fff; border: none; border-radius: 30px; font-size: 1.2rem; cursor: pointer; display: none; }
+#ready-btn, #start-cam-btn { pointer-events: auto; padding: 1rem 3rem; background: #4caf50; color: #fff; border: none; border-radius: 30px; font-size: 1.2rem; cursor: pointer; }
+#ready-btn { display: none; }
 #flash { position: fixed; inset: 0; background: #4caf50; opacity: 0; z-index: 10; pointer-events: none; transition: opacity 0.1s; }
 canvas { display: none; }
 </style>
@@ -1369,26 +1563,34 @@ canvas { display: none; }
 <video id="viewfinder" autoplay playsinline muted></video>
 <canvas id="canvas"></canvas>
 <div id="overlay">
-  <div id="status">Starting camera…</div>
+  <div id="status">Tap Start Camera to begin.</div>
   <div id="ssnr-bar-wrap"><div id="ssnr-bar"></div></div>
+  <button id="start-cam-btn">Start Camera</button>
   <button id="ready-btn">Ready</button>
 </div>
 <div id="flash"></div>
 
 <script>
-const video    = document.getElementById('viewfinder');
-const canvas   = document.getElementById('canvas');
-const ctx      = canvas.getContext('2d');
-const status   = document.getElementById('status');
-const ssnrBar  = document.getElementById('ssnr-bar');
-const readyBtn = document.getElementById('ready-btn');
-const flash    = document.getElementById('flash');
+const video       = document.getElementById('viewfinder');
+const canvas      = document.getElementById('canvas');
+const ctx         = canvas.getContext('2d');
+const status      = document.getElementById('status');
+const ssnrBar     = document.getElementById('ssnr-bar');
+const readyBtn    = document.getElementById('ready-btn');
+const startCamBtn = document.getElementById('start-cam-btn');
+const flash       = document.getElementById('flash');
 
 let ws;
 let capturing = false;
 let captureInterval = null;
 
+// iOS Safari requires getUserMedia to be called from a user gesture handler.
+// Page-load invocation is blocked. Wire to an explicit Start Camera button.
 async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    status.textContent = 'Camera API unavailable. Use HTTPS and a modern browser.';
+    return;
+  }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } }
@@ -1397,14 +1599,19 @@ async function startCamera() {
     await video.play();
     canvas.width  = video.videoWidth  || 1280;
     canvas.height = video.videoHeight || 720;
-    status.textContent = 'Point at the white screen, lock exposure and white balance, then tap Ready.';
+    startCamBtn.style.display = 'none';
+    status.textContent = 'Camera ready. Aim at the PC screen.';
+    connectWs();
   } catch (e) {
-    status.textContent = 'Camera access denied. Please allow camera and reload.';
+    status.textContent = 'Camera access denied: ' + (e.message || e.name);
   }
 }
 
+startCamBtn.onclick = startCamera;
+
 function connectWs() {
-  ws = new WebSocket(`ws://${location.host}/ws/mobile`);
+  const wsScheme = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${wsScheme}//${location.host}/ws/mobile`);
 
   ws.onopen = () => { status.textContent = 'Connected. Waiting for instructions…'; };
 
@@ -1483,7 +1690,6 @@ function sendFrame() {
   ws.send(JSON.stringify({ type: 'frame', data: dataUrl.split(',')[1] }));
 }
 
-startCamera().then(connectWs);
 </script>
 </body>
 </html>
@@ -1525,7 +1731,6 @@ import numpy as np
 from calibration.capture import decode_frame, frame_luminance, is_stable
 from calibration.patches import GRAY_PATCHES, HOLDOUT_PATCHES
 from calibration.ramp import (
-    apply_lut_to_image,
     compose_luts,
     fit_correction,
     identity_lut,
@@ -1539,10 +1744,15 @@ RecvFn = Callable[[], Awaitable[dict]]
 
 SSNR_THRESHOLD = 20.0
 STABLE_FRAMES = 5
-CAPTURE_TIMEOUT = 10.0   # seconds per patch
+CAPTURE_TIMEOUT = 10.0    # seconds per patch
+READY_TIMEOUT = 180.0     # seconds to wait for user to lock WB and tap Ready
+SETTLE_DELAY = 0.3        # seconds for LCD to stabilise on a new patch
 MAX_SKIPPED = 3
 MAX_ROUNDS = 3
 CONVERGENCE_DELTA_E = 1.0
+
+
+DrainFn = Callable[[], Awaitable[None]]
 
 
 async def _wait_for_stable_frames(mobile_recv: RecvFn) -> np.ndarray | None:
@@ -1572,13 +1782,9 @@ async def _wait_for_stable_frames(mobile_recv: RecvFn) -> np.ndarray | None:
     return None   # timed out
 
 
-def _normalize_luma(frame: np.ndarray, white_rgb: np.ndarray) -> float:
-    """Relative luminance: measured luma / white luma. Clamped to [0, 1]."""
-    white_luma = float(
-        0.299 * white_rgb[:, :, 0].mean()
-        + 0.587 * white_rgb[:, :, 1].mean()
-        + 0.114 * white_rgb[:, :, 2].mean()
-    )
+def _normalize_luma(frame: np.ndarray, white_frame: np.ndarray) -> float:
+    """Relative luminance: measured luma / white-reference luma. Clamped to [0, 1]."""
+    white_luma = frame_luminance(white_frame)
     patch_luma = frame_luminance(frame)
     if white_luma < 1e-6:
         return 0.0
@@ -1595,20 +1801,33 @@ async def _capture_white_reference(
     pc_send: SendFn,
     mobile_send: SendFn,
     mobile_recv: RecvFn,
+    mobile_drain: DrainFn,
 ) -> np.ndarray:
     """Show white patch, wait for WB lock from mobile, capture 5 stable frames."""
     level = 255
     await pc_send({"type": "show_patch", "rgb": [level, level, level]})
     await mobile_send({"type": "show_white_for_wb"})
 
-    # Wait for mobile 'ready' message (user locked WB)
-    while True:
-        msg = await mobile_recv()
-        if msg.get("type") == "ready":
-            break
+    # Wait for mobile 'ready' message (user locked WB). Bounded so a dropped
+    # mobile connection does not hang the loop forever.
+    try:
+        while True:
+            msg = await asyncio.wait_for(mobile_recv(), timeout=READY_TIMEOUT)
+            if msg.get("type") == "ready":
+                break
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError("Timed out waiting for mobile to lock white balance.") from exc
 
-    # Capture stable white reference
-    frame = await _wait_for_stable_frames(mobile_recv)
+    # Mobile only streams frames between `capture` and `stop_capture`. The WB
+    # reference also needs frames, so wrap the capture in the same control
+    # messages used for ordinary patches.
+    await asyncio.sleep(SETTLE_DELAY)
+    await mobile_drain()
+    await mobile_send({"type": "capture", "n": 0, "total": 0, "phase": "white_ref"})
+    try:
+        frame = await _wait_for_stable_frames(mobile_recv)
+    finally:
+        await mobile_send({"type": "stop_capture"})
     if frame is None:
         raise RuntimeError(
             "White reference capture timed out. Check room lighting and phone position."
@@ -1625,11 +1844,17 @@ async def _measure_patch(
     pc_send: SendFn,
     mobile_send: SendFn,
     mobile_recv: RecvFn,
+    mobile_drain: DrainFn,
 ) -> float | None:
     """Show one gray patch, capture, return normalized luminance or None if skipped."""
     v = int(round(patch_level * 255))
     await pc_send({"type": "show_patch", "rgb": [v, v, v]})
     await pc_send({"type": "capturing", "round": round_num})
+
+    # Give the display a beat to settle on the new patch, drain any in-flight
+    # stale frames from the previous patch, then tell mobile to start streaming.
+    await asyncio.sleep(SETTLE_DELAY)
+    await mobile_drain()
     await mobile_send({
         "type": "capture",
         "n": patch_index + 1,
@@ -1658,9 +1883,9 @@ async def _measure_patch(
 
 async def run_calibration(
     pc_send: SendFn,
-    pc_recv: RecvFn,
     mobile_send: SendFn,
     mobile_recv: RecvFn,
+    mobile_drain: DrainFn,
     tmp_dir: Path,
 ) -> tuple[bytes, float]:
     """
@@ -1668,7 +1893,7 @@ async def run_calibration(
     Returns (icc_bytes, final_delta_e).
     """
     # --- White reference ---
-    white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv)
+    white_frame = await _capture_white_reference(pc_send, mobile_send, mobile_recv, mobile_drain)
 
     # --- Per-channel float LUTs (start at identity) ---
     lut_r = identity_lut()
@@ -1679,12 +1904,16 @@ async def run_calibration(
     best_luts = (lut_r.copy(), lut_g.copy(), lut_b.copy())
 
     for round_num in range(1, MAX_ROUNDS + 1):
-        # Apply current ramp to display
+        # Apply current ramp to display. dispwin and file I/O are blocking —
+        # offload to a worker thread so the event loop keeps servicing WebSocket
+        # messages (mobile frame stream in particular).
         tmp_icc = tmp_dir / f"round_{round_num}.icc"
         vcgt_r, vcgt_g, vcgt_b = lut_to_vcgt(lut_r), lut_to_vcgt(lut_g), lut_to_vcgt(lut_b)
-        tmp_icc.write_bytes(build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b))
-        clear_ramp()
-        apply_ramp(str(tmp_icc))
+        await asyncio.to_thread(
+            tmp_icc.write_bytes, build_vcgt_profile(vcgt_r, vcgt_g, vcgt_b)
+        )
+        await asyncio.to_thread(clear_ramp)
+        await asyncio.to_thread(apply_ramp, str(tmp_icc))
 
         # Measure each calibration patch
         measured_lumas: list[float] = []
@@ -1696,7 +1925,7 @@ async def run_calibration(
         for i, patch in enumerate(patches):
             luma = await _measure_patch(
                 patch.level, i, total, round_num,
-                white_frame, pc_send, mobile_send, mobile_recv,
+                white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
             )
             if luma is None:
                 skipped += 1
@@ -1714,7 +1943,7 @@ async def run_calibration(
         target   = np.array(target_lumas)
 
         # Same curve applied to all 3 channels (gray patches only)
-        new_lut = fit_correction(levels, measured, target)
+        new_lut = fit_correction(levels, measured)
         lut_r = compose_luts(lut_r, new_lut)
         lut_g = compose_luts(lut_g, new_lut)
         lut_b = compose_luts(lut_b, new_lut)
@@ -1731,11 +1960,14 @@ async def run_calibration(
             break
 
     # --- Holdout verification ---
+    await pc_send({"type": "holdout_started", "total": len(HOLDOUT_PATCHES)})
+    await mobile_send({"type": "holdout_started", "total": len(HOLDOUT_PATCHES)})
     holdout_measured: list[float] = []
     for i, patch in enumerate(HOLDOUT_PATCHES):
+        # round_num=0 signals "holdout, not a calibration round" to the UI.
         luma = await _measure_patch(
-            patch.level, i, len(HOLDOUT_PATCHES), MAX_ROUNDS + 1,
-            white_frame, pc_send, mobile_send, mobile_recv,
+            patch.level, i, len(HOLDOUT_PATCHES), 0,
+            white_frame, pc_send, mobile_send, mobile_recv, mobile_drain,
         )
         holdout_measured.append(luma if luma is not None else patch.target_luma)
 
@@ -1758,10 +1990,98 @@ uv run python -c "import sys; sys.path.insert(0,'src'); from calibration.iterate
 ```
 Expected: `OK`
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Integration test for the loop**
+
+Create `tests/calibration/test_iterate.py`:
+
+```python
+import base64
+import tempfile
+from io import BytesIO
+from pathlib import Path
+
+import numpy as np
+import pytest
+from PIL import Image
+
+import calibration.iterate as iterate
+from calibration.iterate import run_calibration
+
+
+def _b64_jpeg_gray(level_0_1: float) -> str:
+    v = int(round(np.clip(level_0_1, 0.0, 1.0) * 255))
+    img = Image.new("RGB", (64, 64), (v, v, v))
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=95)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+class FakeProtocol:
+    """
+    Simulates the mobile WebSocket. Produces JPEG frames whose grayscale level
+    follows `display_gamma`: for input x, the camera 'sees' x ** gamma.
+    """
+
+    def __init__(self, display_gamma: float):
+        self.gamma = display_gamma
+        self.current_input = 1.0  # white reference patch
+        self.sent: list[dict] = []
+        self.recv_queue: list[dict] = []
+
+    async def pc_send(self, msg: dict) -> None:
+        self.sent.append(("pc", msg))
+        if msg.get("type") == "show_patch":
+            r, g, b = msg["rgb"]
+            self.current_input = (r + g + b) / 3.0 / 255.0
+
+    async def mobile_send(self, msg: dict) -> None:
+        self.sent.append(("mobile", msg))
+        if msg.get("type") == "show_white_for_wb":
+            # User locks WB and taps Ready.
+            self.recv_queue.append({"type": "ready"})
+
+    async def mobile_recv(self) -> dict:
+        # Either pop a scripted message or synthesize a frame from current input.
+        if self.recv_queue:
+            return self.recv_queue.pop(0)
+        return {"type": "frame", "data": _b64_jpeg_gray(self.current_input ** self.gamma)}
+
+    async def mobile_drain(self) -> None:
+        self.recv_queue.clear()
+
+
+@pytest.mark.asyncio
+async def test_run_calibration_converges_on_gamma_1_8_display(monkeypatch):
+    # Stub dispwin so the test does not touch the real display.
+    monkeypatch.setattr(iterate, "clear_ramp", lambda *a, **k: None)
+    monkeypatch.setattr(iterate, "apply_ramp", lambda *a, **k: None)
+    # Settle delay is for real LCDs; skip in tests so the loop runs in seconds.
+    monkeypatch.setattr(iterate, "SETTLE_DELAY", 0.0)
+
+    fake = FakeProtocol(display_gamma=1.8)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        icc_bytes, delta_e = await run_calibration(
+            fake.pc_send, fake.mobile_send, fake.mobile_recv, fake.mobile_drain, Path(tmp)
+        )
+
+    assert isinstance(icc_bytes, bytes) and len(icc_bytes) > 256
+    assert icc_bytes[36:40] == b"acsp"
+    # Even without modeling the LUT applying back into the camera (we stub
+    # dispwin), the holdout ΔE is computed against target — a finite, sane
+    # number rather than NaN/inf — confirms the loop ran end-to-end.
+    assert np.isfinite(delta_e)
+```
+
+> **Note:** This test stubs `dispwin`, so the simulated display gamma does not actually change between rounds. The assertion verifies the loop terminates, builds a valid ICC, and returns a finite ΔE — i.e. the orchestration is correct. A higher-fidelity test would model the LUT round-tripping through the simulated camera; out of scope for this plan.
+
+Run: `uv run pytest tests/calibration/test_iterate.py -v`
+Expected: 1 passed.
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add src/calibration/iterate.py
+git add src/calibration/iterate.py tests/calibration/test_iterate.py
 git commit -m "feat: iterative calibration loop — measure, fit, compose, converge, holdout verify"
 ```
 
@@ -1771,31 +2091,43 @@ git commit -m "feat: iterative calibration loop — measure, fit, compose, conve
 
 The PC page shows a before/after comparison after calibration. The server generates both images using Pillow: the original `test_chart.png` as "before", and the LUT-corrected version as "after". Both are sent as base64 PNG in the `result` message.
 
-- [ ] **Step 1: Add a placeholder `test_chart.png`**
+- [ ] **Step 1: Generate `test_chart.png` lazily, never commit it**
 
-If you don't have a real test chart, generate one with gradient swatches:
+The chart is a build artifact, not source. Add it to `.gitignore` and synthesize on demand inside the server.
 
 ```bash
-uv run python - <<'EOF'
-import sys; sys.path.insert(0,'src')
-import numpy as np
-from PIL import Image
+echo "src/web/static/test_chart.png" >> .gitignore
+```
 
-# Horizontal gradient + colour swatches
-w, h = 640, 240
-img = np.zeros((h, w, 3), dtype=np.uint8)
-# Top half: gray gradient
-for x in range(w):
-    v = int(x / w * 255)
-    img[:h//2, x] = [v, v, v]
-# Bottom half: colour strips
-colours = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),(0,255,255),(255,0,255),(255,165,0),(128,0,128)]
-strip_w = w // len(colours)
-for i, c in enumerate(colours):
-    img[h//2:, i*strip_w:(i+1)*strip_w] = c
-Image.fromarray(img).save('src/web/static/test_chart.png')
-print('test_chart.png created')
-EOF
+Add to `src/web/server.py` (near the other helpers):
+
+```python
+def _ensure_test_chart(path: Path) -> None:
+    if path.exists():
+        return
+    import numpy as np
+    from PIL import Image
+    w, h = 640, 240
+    img = np.zeros((h, w, 3), dtype=np.uint8)
+    for x in range(w):
+        v = int(x / w * 255)
+        img[: h // 2, x] = [v, v, v]
+    colours = [
+        (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+        (0, 255, 255), (255, 0, 255), (255, 165, 0), (128, 0, 128),
+    ]
+    strip_w = w // len(colours)
+    for i, c in enumerate(colours):
+        img[h // 2 :, i * strip_w : (i + 1) * strip_w] = c
+    Image.fromarray(img).save(path)
+```
+
+Call it from `_run_calibration_task` just before `_build_comparison_b64`:
+
+```python
+            chart_path = STATIC_DIR / "test_chart.png"
+            _ensure_test_chart(chart_path)
+            before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
 ```
 
 - [ ] **Step 2: Add `_build_comparison` helper to `src/web/server.py`**
@@ -1832,54 +2164,49 @@ def _build_comparison_b64(
     return to_b64(img), to_b64(corrected)
 ```
 
-Update `_run_calibration_task` to unpack and pass the LUTs. Since `run_calibration` currently returns `(icc_bytes, delta_e)`, extend it to also return the final LUTs by changing its return type.
+- [ ] **Step 2a: Change `run_calibration` return shape to include final LUTs**
 
-Update `src/calibration/iterate.py` — change the final return statement:
+In `src/calibration/iterate.py`, update the signature and the final return statement only — do not rewrite the body.
 
-```python
-    return icc_bytes, final_delta_e, lut_r, lut_g, lut_b
-```
-
-And update the return type annotation in the function signature:
-
+Signature change:
 ```python
 ) -> tuple[bytes, float, np.ndarray, np.ndarray, np.ndarray]:
 ```
 
-Update `_run_calibration_task` in `server.py`:
-
+Final return change:
 ```python
-async def _run_calibration_task() -> None:
-    from calibration.iterate import run_calibration
+    return icc_bytes, final_delta_e, lut_r, lut_g, lut_b
+```
 
-    pc, mobile = session.pc, session.mobile
-    if pc is None or mobile is None:
-        return
+- [ ] **Step 2b: Targeted edits in `src/web/server.py`**
 
-    async def pc_send(msg):  await _send(pc, msg)
-    async def pc_recv():     return await _recv(pc)
-    async def mobile_send(msg): await _send(mobile, msg)
-    async def mobile_recv():    return await _recv(mobile)
+Patch only the two lines below. Do **not** redefine `_run_calibration_task` — the surrounding code from Task 8 stays as-is.
 
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        try:
+Find:
+```python
+            icc_bytes, delta_e = await run_calibration(
+                pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp)
+            )
+            icc_b64 = base64.b64encode(icc_bytes).decode()
+            await _send(pc.ws, {"type": "result", "icc_b64": icc_b64, "delta_e": delta_e})
+```
+
+Replace with:
+```python
             icc_bytes, delta_e, lut_r, lut_g, lut_b = await run_calibration(
-                pc_send, pc_recv, mobile_send, mobile_recv, Path(tmp)
+                pc_send, mobile_send, mobile_recv, mobile_drain, Path(tmp)
             )
             icc_b64 = base64.b64encode(icc_bytes).decode()
             chart_path = STATIC_DIR / "test_chart.png"
+            _ensure_test_chart(chart_path)
             before_b64, after_b64 = _build_comparison_b64(chart_path, lut_r, lut_g, lut_b)
-            await _send(pc, {
+            await _send(pc.ws, {
                 "type": "result",
                 "icc_b64": icc_b64,
                 "delta_e": delta_e,
                 "before_b64": before_b64,
                 "after_b64": after_b64,
             })
-            await _send(mobile, {"type": "all_done"})
-        except Exception as exc:
-            await _send(pc, {"type": "error", "message": str(exc)})
 ```
 
 - [ ] **Step 3: Verify imports after editing**
@@ -1893,7 +2220,7 @@ Expected: `OK`
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/web/static/test_chart.png src/web/server.py src/calibration/iterate.py
+git add .gitignore src/web/server.py src/calibration/iterate.py
 git commit -m "feat: before/after comparison image — LUT applied via Pillow, sent as PNG base64"
 ```
 
@@ -1913,6 +2240,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from display.dispwin import find_dispwin
+from util.tls import detect_lan_ip, ensure_cert
 
 
 def main():
@@ -1927,19 +2255,22 @@ def main():
         )
         sys.exit(1)
 
-    import socket
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-    finally:
-        s.close()
+    cert_path, key_path = ensure_cert(Path(__file__).parent / ".cert")
+    ip = detect_lan_ip()
 
-    print(f"\n[color-calibrator] Server starting on http://{ip}:8765")
-    print(f"[color-calibrator] Mobile URL: http://{ip}:8765/mobile\n")
+    print(f"\n[color-calibrator] Server starting on https://{ip}:8765")
+    print(f"[color-calibrator] Mobile URL: https://{ip}:8765/mobile")
+    print("[color-calibrator] Self-signed cert: accept the browser warning once.\n")
 
     import uvicorn
-    uvicorn.run("web.server:app", host="0.0.0.0", port=8765, reload=False)
+    uvicorn.run(
+        "web.server:app",
+        host="0.0.0.0",
+        port=8765,
+        reload=False,
+        ssl_keyfile=str(key_path),
+        ssl_certfile=str(cert_path),
+    )
 
 
 if __name__ == "__main__":
@@ -1960,12 +2291,16 @@ If dispwin is not installed, you'll see the install error — that's correct beh
 ```bash
 uv run python -c "
 import sys; sys.path.insert(0,'src')
+from pathlib import Path
+from util.tls import ensure_cert
+cert, key = ensure_cert(Path('.cert'))
 import uvicorn
-uvicorn.run('web.server:app', host='127.0.0.1', port=8765)
+uvicorn.run('web.server:app', host='127.0.0.1', port=8765,
+            ssl_keyfile=str(key), ssl_certfile=str(cert))
 "
 ```
 
-Then open `http://127.0.0.1:8765/` in a browser. Expected: PC page loads, attempts WebSocket, shows QR screen skeleton.
+Then open `https://127.0.0.1:8765/` in a browser. Expected: browser warns about self-signed cert (accept), then PC page loads, attempts WebSocket, shows QR screen skeleton.
 
 - [ ] **Step 4: Final commit**
 
